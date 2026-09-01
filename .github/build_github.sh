@@ -6,8 +6,10 @@ brew install ldid
 # move lc to working folder
 mv "$archive_path.xcarchive/Products/Applications" Payload
 
-# Remove LiveContainer update reminder (emulate manual Info.plist 3.8 -> 93.8 fix)
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 93.8" ./Payload/LiveContainer.app/Info.plist
+# Suppress SideStore update banner: version must be strict 3-part semver (major.minor.patch),
+# otherwise SemanticVersion() fails to parse and hasUpdate falls back to string mismatch = update shown.
+# 9999.0.0 parses OK and is greater than any upstream LiveContainer release.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 9999.0.0" ./Payload/LiveContainer.app/Info.plist
 
 # temporarily move sidestore support framrwork to tmp before zip
 mkdir tmp
