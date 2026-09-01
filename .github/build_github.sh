@@ -6,6 +6,9 @@ brew install ldid
 # move lc to working folder
 mv "$archive_path.xcarchive/Products/Applications" Payload
 
+# Remove LiveContainer update reminder (emulate manual Info.plist 3.8 -> 93.8 fix)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 93.8" ./Payload/LiveContainer.app/Info.plist
+
 # temporarily move sidestore support framrwork to tmp before zip
 mkdir tmp
 mv Payload/LiveContainer.app/Frameworks/SideStore.framework ./tmp
@@ -41,7 +44,7 @@ mv ./tmp/SideStore.framework Payload/LiveContainer.app/Frameworks
 
 # download SideStore
 cd tmp
-wget https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa
+wget https://github.com/liehuu/SideStore/releases/download/nightly/SideStore.ipa
 unzip SideStore.ipa
 cd ..
 
