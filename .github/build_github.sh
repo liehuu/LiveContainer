@@ -130,7 +130,23 @@ else
     SELF_CHECK_PASS=false
 fi
 
-# 3. no competing metadata left inside embedded bundles
+# 3. the framework must export the C entry points the main app dlopen()s
+FW="$APP/Frameworks/SideStore.framework/SideStore"
+if [ -f "$FW" ]; then
+    for sym in LCRefreshAllAppsStart LCRefreshAllAppsIsRunning; do
+        if nm -gU "$FW" 2>/dev/null | grep -q "$sym"; then
+            summary "- [OK] $sym exported by SideStore.framework"
+        else
+            summary "- [FAIL] $sym NOT exported by SideStore.framework (main app cannot drive the refresh)"
+            SELF_CHECK_PASS=false
+        fi
+    done
+else
+    summary "- [FAIL] SideStore.framework not found at $FW"
+    SELF_CHECK_PASS=false
+fi
+
+# 4. no competing metadata left inside embedded bundles
 STRAY=$(find "$APP/Frameworks" "$APP/PlugIns" -name "Metadata.appintents" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$STRAY" -eq 0 ]; then
     summary "- [OK] no Metadata.appintents under Frameworks/PlugIns (no phantom provider)"

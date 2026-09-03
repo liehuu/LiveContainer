@@ -32,7 +32,6 @@
 		E16D95742E1CD2980068EB63 /* LCMachOUtils.m in Sources */ = {isa = PBXBuildFile; fileRef = E16D94DE2E1CC8200068EB63 /* LCMachOUtils.m */; };
 		E16D95752E1CD2B90068EB63 /* LiveContainerShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E1292BD62DCA3B660065E12D /* LiveContainerShared.framework */; };
 		F1A2B3C40000000200000001 /* LCAppShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3C40000000100000001 /* LCAppShortcuts.swift */; };
-		F1A2B3C40000000300000001 /* SideStore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 173545A82E2C7913001B3B4C /* SideStore.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -383,7 +382,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F1A2B3C40000000300000001 /* SideStore.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1003,8 +1001,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F1A2B3C40000000200000001 /* LCAppShortcuts.swift in Sources */,
 				E1292C132DCA46070065E12D /* main.c in Sources */,
+				F1A2B3C40000000200000001 /* LCAppShortcuts.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

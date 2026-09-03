@@ -25,54 +25,60 @@ public struct RefreshAllAppsWidgetIntent: AppIntent, ProgressReportingIntent
     }
 }
 
-@available(iOS 17.0, *)
-public struct RefreshAllAppsIntent: AppIntent, CustomIntentMigratedAppIntent, PredictableIntent, ProgressReportingIntent, ForegroundContinuableIntent
-{
-    public static let intentClassName = "RefreshAllIntent"
-    
-    public static var title: LocalizedStringResource = "Refresh All Apps"
-    public static var description = IntentDescription("Refreshes your sideloaded apps to prevent them from expiring.")
-    
-    public init() {}
-    
-    public static var parameterSummary: some ParameterSummary {
-        Summary("Refresh All Apps")
-    }
-    
-    public static var predictionConfiguration: some IntentPredictionConfiguration {
-        IntentPrediction {
-            DisplayRepresentation(
-                title: "Refresh All Apps",
-                subtitle: ""
-            )
-        }
-    }
-    
-    public func perform() async throws -> some IntentResult
-    {
-        RefreshHandler.shared.progress = progress
-        progress.totalUnitCount = 100
-        try await RefreshHandler.shared.startRefresh()
-        return .result(dialog: "All apps have been refreshed.")
+// ---------------------------------------------------------------------------
+// C entry points for the main app's refresh shortcut.
+//
+// The AppShortcutsProvider that drives the Siri/Shortcuts entry lives in the MAIN
+// APP binary (LiveContainer/LCAppShortcuts.swift), because AppIntents resolves the
+// provider named in the main bundle's metadata against the main app executable --
+// a provider buried in an embedded framework is reported as "Couldn't find
+// AppShortcutsProvider". On a cold launch from a shortcut nothing has loaded this
+// framework yet, so the main app dlopen()s it and reaches the refresh machinery
+// through these plain C symbols (no module import, no linking, no ObjC bridging
+// header needed in the main app target).
+// ---------------------------------------------------------------------------
+private final class LCRefreshState {
+    static let shared = LCRefreshState()
+    private let lock = NSLock()
+    private var _running = false
+    var running: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _running }
+        set { lock.lock(); _running = newValue; lock.unlock() }
     }
 }
 
+/// Starts a refresh. Returns 0 when it was started, 1 when one is already running.
+@_cdecl("LCRefreshAllAppsStart")
+public func LCRefreshAllAppsStart() -> Int32 {
+    if LCRefreshState.shared.running {
+        return 1
+    }
+    LCRefreshState.shared.running = true
+    Task {
+        defer { LCRefreshState.shared.running = false }
+        try? await RefreshHandler.shared.startRefresh()
+    }
+    return 0
+}
 
-// public so the main app binary can drive a refresh from its own AppIntent:
-// the AppShortcutsProvider must be compiled into the main app (see
-// LiveContainer/LCAppShortcuts.swift), so perform() runs there and needs to
-// reach this handler across the module boundary.
-public class RefreshHandler: NSObject, RefreshServer {
+/// 1 while a refresh started through LCRefreshAllAppsStart() is still running.
+@_cdecl("LCRefreshAllAppsIsRunning")
+public func LCRefreshAllAppsIsRunning() -> Int32 {
+    LCRefreshState.shared.running ? 1 : 0
+}
+
+
+class RefreshHandler: NSObject, RefreshServer {
     var c: UnsafeContinuation<(), any Error>? = nil
     var launchContinuation: UnsafeContinuation<(), any Error>? = nil
-    public var progress: Progress? = nil
+    var progress: Progress? = nil
     var listener: NSXPCListener? = nil
     var sideStorePid: Int32 = 0
     var client: RefreshClient? = nil
     var ext: NSExtension? = nil
     
     private static var _shared: RefreshHandler? = nil
-    public static var shared: RefreshHandler {
+    static var shared: RefreshHandler {
         get {
             if let _shared {
                 return _shared
@@ -84,7 +90,7 @@ public class RefreshHandler: NSObject, RefreshServer {
     }
     
     
-    public func startRefresh() async throws {
+    func startRefresh() async throws {
         if sideStorePid <= 0 || getpgid(sideStorePid) <= 0, let c {
             c.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore quit unexpectedly"]))
             self.c = nil
