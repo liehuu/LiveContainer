@@ -58,7 +58,34 @@ jobs:
           scheme: ${{ steps.scheme.outputs.scheme }}
           filetype_parameter: ${{ steps.filetype_parameter.outputs.filetype_parameter }}
           file_to_build: ${{ steps.file_to_build.outputs.file_to_build }}
-        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release | xcpretty && exit ${PIPESTATUS[0]}
+        run: |
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee "$LOG" | xcpretty
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "===== ARCHIVE FAILED (exit $status) ====="
+              echo '```'
+              grep -E ": (error|fatal error):|\*\* ARCHIVE FAILED \*\*|\*\* BUILD FAILED \*\*" "$LOG" | head -60
+              echo '```'
+              echo
+              echo "===== note: lines (compiler suggested fixes) ====="
+              echo '```'
+              grep -E ": note:" "$LOG" | head -40
+              echo '```'
+              echo
+              echo "===== AppIntents / availability / our files ====="
+              echo '```'
+              grep -iE "appintents|is only available|LCAppShortcuts|SideStore/SideStore.swift|ExtractAppIntents" "$LOG" | head -60
+              echo '```'
+              echo
+              echo "===== linker / undefined symbols ====="
+              echo '```'
+              grep -E "Undefined symbols|undefined symbol|duplicate symbol|ld: |clang: error:|swift-driver" "$LOG" | head -60
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit "$status"
+          fi
       - name: Tar Build Artifact
         run: tar -cvf "$archive_path.xcarchive.tar" "$archive_path.xcarchive"
       - name: Upload a Build Artifact
