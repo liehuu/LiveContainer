@@ -41,16 +41,18 @@ public struct LCRefreshAllAppsIntent: AppIntent {
 
 @available(iOS 16.0, *)
 public struct LiveContainerShortcutsProvider: AppShortcutsProvider {
+    // appShortcuts is an @AppShortcutsBuilder property: the entries are listed
+    // directly. Wrapping them in an array literal makes the builder try to feed
+    // the array to buildBlock(_: AppShortcut) and fails with
+    // "cannot convert value of type '[AppShortcut]' to expected argument type 'AppShortcut'".
     public static var appShortcuts: [AppShortcut] {
-        [
-            AppShortcut(
-                intent: LCRefreshAllAppsIntent(),
-                phrases: [
-                    "Refresh all apps in \(.applicationName)",
-                    "Refresh my \(.applicationName) apps"
-                ]
-            )
-        ]
+        AppShortcut(
+            intent: LCRefreshAllAppsIntent(),
+            phrases: [
+                "Refresh all apps in \(.applicationName)",
+                "Refresh my \(.applicationName) apps"
+            ]
+        )
     }
 }
 
