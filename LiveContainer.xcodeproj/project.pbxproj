@@ -31,6 +31,8 @@
 		E1292C132DCA46070065E12D /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = E1292C032DCA3C160065E12D /* main.c */; };
 		E16D95742E1CD2980068EB63 /* LCMachOUtils.m in Sources */ = {isa = PBXBuildFile; fileRef = E16D94DE2E1CC8200068EB63 /* LCMachOUtils.m */; };
 		E16D95752E1CD2B90068EB63 /* LiveContainerShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E1292BD62DCA3B660065E12D /* LiveContainerShared.framework */; };
+		F1A2B3C40000000200000001 /* LCAppShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3C40000000100000001 /* LCAppShortcuts.swift */; };
+		F1A2B3C40000000300000001 /* SideStore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 173545A82E2C7913001B3B4C /* SideStore.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -182,6 +184,7 @@
 		E16D94DE2E1CC8200068EB63 /* LCMachOUtils.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = LCMachOUtils.m; sourceTree = "<group>"; };
 		E16D95762E1CD49E0068EB63 /* LCMachOUtils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = LCMachOUtils.h; sourceTree = "<group>"; };
 		E16D9BA02E1D48DE0068EB63 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		F1A2B3C40000000100000001 /* LCAppShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LCAppShortcuts.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -380,6 +383,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F1A2B3C40000000300000001 /* SideStore.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -421,6 +425,7 @@
 			isa = PBXGroup;
 			children = (
 				E16D95762E1CD49E0068EB63 /* LCMachOUtils.h */,
+				F1A2B3C40000000100000001 /* LCAppShortcuts.swift */,
 				E1292C032DCA3C160065E12D /* main.c */,
 				E1292C1A2DCA48F00065E12D /* Tweaks */,
 				E11884B82EF7A15F009C6FA6 /* dyld_bypass_validation.h */,
@@ -998,6 +1003,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F1A2B3C40000000200000001 /* LCAppShortcuts.swift in Sources */,
 				E1292C132DCA46070065E12D /* main.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

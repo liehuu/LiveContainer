@@ -58,17 +58,21 @@ public struct RefreshAllAppsIntent: AppIntent, CustomIntentMigratedAppIntent, Pr
 }
 
 
-class RefreshHandler: NSObject, RefreshServer {
+// public so the main app binary can drive a refresh from its own AppIntent:
+// the AppShortcutsProvider must be compiled into the main app (see
+// LiveContainer/LCAppShortcuts.swift), so perform() runs there and needs to
+// reach this handler across the module boundary.
+public class RefreshHandler: NSObject, RefreshServer {
     var c: UnsafeContinuation<(), any Error>? = nil
     var launchContinuation: UnsafeContinuation<(), any Error>? = nil
-    var progress: Progress? = nil
+    public var progress: Progress? = nil
     var listener: NSXPCListener? = nil
     var sideStorePid: Int32 = 0
     var client: RefreshClient? = nil
     var ext: NSExtension? = nil
     
     private static var _shared: RefreshHandler? = nil
-    static var shared: RefreshHandler {
+    public static var shared: RefreshHandler {
         get {
             if let _shared {
                 return _shared
@@ -80,7 +84,7 @@ class RefreshHandler: NSObject, RefreshServer {
     }
     
     
-    func startRefresh() async throws {
+    public func startRefresh() async throws {
         if sideStorePid <= 0 || getpgid(sideStorePid) <= 0, let c {
             c.resume(throwing: NSError(domain: "SideStore", code: 1, userInfo: [NSLocalizedDescriptionKey: "Built-in SideStore quit unexpectedly"]))
             self.c = nil

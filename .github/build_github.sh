@@ -61,7 +61,17 @@ cp ./.github/sidelc/LCAppInfo.plist ./Payload/LiveContainer.app/Frameworks/SideS
 # copy intents
 cp ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Intents.intentdefinition ./Payload/LiveContainer.app/
 cp ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/ViewApp.intentdefinition ./Payload/LiveContainer.app/
-cp -r ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Metadata.appintents ./Payload/LiveContainer.app/Metadata.appintents
+
+# The main app now carries its own AppShortcutsProvider
+# (LiveContainer/LCAppShortcuts.swift), so Xcode emits the app's own
+# Metadata.appintents at archive time. Do NOT overwrite it with the dylibified
+# SideStore's copy: that copy describes upstream's ShortcutsProvider, whose type
+# is compiled into the framework binary rather than the main app one, so
+# AppIntents can never resolve it -- the "Couldn't find AppShortcutsProvider"
+# failure. Any leftover metadata inside the embedded bundles is likewise a
+# phantom entry, so remove it.
+find ./Payload/LiveContainer.app/Frameworks ./Payload/LiveContainer.app/PlugIns \
+     -name "Metadata.appintents" -exec rm -rf {} + 2>/dev/null || true
 
 # AltWidgetExtension
 mv ./Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/PlugIns/AltWidgetExtension.appex ./Payload/LiveContainer.app/PlugIns/LiveWidgetExtension.appex
@@ -75,6 +85,68 @@ rm -r .zsign_cache
 find payloadlc/Payload -type d -name "_CodeSignature" -exec rm -r {} +
 
 ldid -S.github/sidelc/LiveWidgetExtension_adhoc.xml ./Payload/LiveContainer.app/PlugIns/LiveWidgetExtension.appex/LiveWidgetExtension
+
+# ---------------------------------------------------------------------------
+# AppIntents self-check.
+# Prove the shipped bundle exposes exactly one working refresh shortcut and that
+# its provider is compiled into the MAIN APP binary -- AppIntents resolves the
+# provider named in the main bundle's metadata against the main app binary, so a
+# provider living in an embedded framework can never be found. Runs before
+# packaging so a bad build never turns into a downloadable ipa.
+# ---------------------------------------------------------------------------
+summary() { printf '%s\n' "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"; }
+
+APP="./Payload/LiveContainer.app"
+EXE="$APP/LiveContainer"
+SELF_CHECK_PASS=true
+
+summary "===== APPINTENTS SELF-CHECK ====="
+summary "CFBundleVersion: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" 2>/dev/null)"
+
+# 1. the main app must ship its own generated metadata
+if [ -e "$APP/Metadata.appintents" ]; then
+    summary "- [OK] main app Metadata.appintents present ($(du -sh "$APP/Metadata.appintents" 2>/dev/null | awk '{print $1}'))"
+else
+    summary "- [FAIL] main app Metadata.appintents MISSING (Xcode generated none for the main app target)"
+    SELF_CHECK_PASS=false
+fi
+
+# 2. provider and intent must be compiled into the MAIN APP binary
+if [ -f "$EXE" ]; then
+    for sym in LiveContainerShortcutsProvider LCRefreshAllAppsIntent; do
+        # grep -c rather than grep -q: -q exits early, and the resulting SIGPIPE
+        # would be reported as a pipeline failure under `set -o pipefail`.
+        if [ "$(strings -a "$EXE" 2>/dev/null | grep -c "$sym" || true)" -gt 0 ]; then
+            summary "- [OK] $sym found in main app binary"
+        else
+            summary "- [FAIL] $sym NOT in main app binary (AppIntents cannot resolve the provider)"
+            SELF_CHECK_PASS=false
+        fi
+    done
+    # informational: the legacy SiriKit class the old migration-backed intent depended on
+    summary "- [info] legacy 'RefreshAllIntent' hits in main app binary: $(strings -a "$EXE" 2>/dev/null | grep -c 'RefreshAllIntent' || true)"
+else
+    summary "- [FAIL] main app executable not found at $EXE"
+    SELF_CHECK_PASS=false
+fi
+
+# 3. no competing metadata left inside embedded bundles
+STRAY=$(find "$APP/Frameworks" "$APP/PlugIns" -name "Metadata.appintents" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$STRAY" -eq 0 ]; then
+    summary "- [OK] no Metadata.appintents under Frameworks/PlugIns (no phantom provider)"
+else
+    summary "- [FAIL] $STRAY stray Metadata.appintents under Frameworks/PlugIns"
+    SELF_CHECK_PASS=false
+fi
+
+summary ""
+if [ "$SELF_CHECK_PASS" = true ]; then
+    summary "VERDICT: [CLEAN] provider is in the main app binary -- safe to install."
+else
+    summary "VERDICT: [FAIL] do NOT install; no ipa produced."
+    exit 1
+fi
+summary "===== END APPINTENTS SELF-CHECK ====="
 
 # package
 zip -r "$scheme+SideStore.ipa" "Payload" -x "._*" -x ".DS_Store" -x "__MACOSX"
