@@ -21,6 +21,7 @@ void init_bypassDyldLibValidation(void);
 // Phase logger shared by the bootstrap + dyld-bypass/tweak code paths so a
 // silent LiveProcess hang becomes diagnosable from the app-group defaults.
 void LCTrollStoreSetDiag(NSString *phase);
+void LCTrollStoreResetDiag(void);
 kern_return_t builtin_vm_protect(mach_port_name_t task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_max, vm_prot_t new_prot);
 void *jitless_hook_dlopen(const char *path, int mode);
 

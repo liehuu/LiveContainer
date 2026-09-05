@@ -193,8 +193,10 @@ static void enableSelfJITIfNeeded(void) {
 #endif
 }
 
-// Phase logger so a silent LiveProcess crash becomes diagnosable: the main app
-// reads this from the app-group shared defaults and shows the last reached phase.
+// Phase logger so a silent LiveProcess hang becomes diagnosable: the main app
+// reads this from the app-group shared defaults and shows the reached phases.
+// We APPEND every phase (not overwrite) so the full ordered sequence survives a
+// hang, and the user can paste all of it instead of only the last line.
 void LCTrollStoreSetDiag(NSString *phase) {
     @try {
         if (!lcSharedDefaults) return;
@@ -202,10 +204,27 @@ void LCTrollStoreSetDiag(NSString *phase) {
         fmt.dateFormat = @"HH:mm:ss";
         NSString *s = [NSString stringWithFormat:@"[%@] %@",
                        [fmt stringFromDate:[NSDate date]], phase];
-        [lcSharedDefaults setObject:s forKey:@"LCTrollStoreLaunchDiag"];
+        NSString *existing = [lcSharedDefaults stringForKey:@"LCTrollStoreLaunchDiag"];
+        if (existing.length) existing = [existing stringByAppendingString:@"\n"];
+        [lcSharedDefaults setObject:[existing stringByAppendingString:s]
+                             forKey:@"LCTrollStoreLaunchDiag"];
         [lcSharedDefaults synchronize];
     } @catch (NSException *e) { /* ignore */ }
 }
+
+// Cleared at the start of every guest launch so each run shows only its own
+// ordered phases (otherwise a hung run's tail pollutes the next run's view).
+void LCTrollStoreResetDiag(void) {
+    @try {
+        if (!lcSharedDefaults) return;
+        [lcSharedDefaults removeObjectForKey:@"LCTrollStoreLaunchDiag"];
+        [lcSharedDefaults synchronize];
+    } @catch (NSException *e) { /* ignore */ }
+}
+
+// The launching thread, captured right before dlopen so the watchdog can read
+// its register state and tell us exactly where it is stuck.
+static mach_port_t lcDlopenThread = 0;
 
 static uint64_t rnd64(uint64_t v, uint64_t r) {
     r--;
@@ -356,6 +375,7 @@ static void *getAppEntryPoint(void *handle) {
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
+    LCTrollStoreResetDiag();
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
@@ -691,12 +711,37 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // wall-clock. If we are still inside dlopen after ~12s the guest is hung
     // (not crashing) — record that so the next run shows the stall instead of a
     // silent black screen, and so we can tell a dlopen hang apart from an earlier
-    // failure.
+    // failure. We also snapshot the blocked thread's PC to tell a dyld-internal
+    // deadlock (our no-lock vtable patch not taking effect) from a guest
+    // initializer deadlock.
+    lcDlopenThread = mach_thread_self();
     __block BOOL lcDlopenReturned = NO;
     dispatch_queue_t lcWatchdogQ = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), lcWatchdogQ, ^{
         if (!lcDlopenReturned) {
             LCTrollStoreSetDiag(@"guest:dlopen-timeout(>12s) — still blocked inside dlopen");
+            if (lcDlopenThread) {
+                arm_thread_state64_t state;
+                mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+                kern_return_t kr = thread_get_state(lcDlopenThread, ARM_THREAD_STATE64,
+                                                    (thread_state_t)&state, &count);
+                if (kr == KERN_SUCCESS) {
+                    uintptr_t pc = (uintptr_t)state.__pc;
+                    Dl_info info;
+                    const char *img = "?";
+                    const char *sym = "?";
+                    if (dladdr((void *)pc, &info)) {
+                        if (info.dli_fname) img = info.dli_fname;
+                        if (info.dli_sname) sym = info.dli_sname;
+                    }
+                    LCTrollStoreSetDiag([NSString stringWithFormat:
+                        @"guest:dlopen-stuck PC=0x%llx img=%s sym=%s",
+                        (uint64_t)pc, img, sym]);
+                } else {
+                    LCTrollStoreSetDiag([NSString stringWithFormat:
+                        @"guest:dlopen-stuck (thread_get_state kr=%d)", kr]);
+                }
+            }
         }
     });
 
