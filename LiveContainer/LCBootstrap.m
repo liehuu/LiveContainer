@@ -17,11 +17,15 @@
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
-#include <sys/ptrace.h>
+#include <sys/types.h>
 #include <errno.h>
 #ifndef PT_TRACE_ME
 #define PT_TRACE_ME 0
 #endif
+// ptrace() is not declared in the public iOS SDK headers, and modern clang
+// treats an implicit function declaration as a hard error. Declare it ourselves
+// with the standard Darwin signature so the call below compiles cleanly.
+extern int ptrace(int request, pid_t pid, caddr_t addr, int data);
 
 static int (*appMain)(int, char**);
 NSUserDefaults *lcUserDefaults;
