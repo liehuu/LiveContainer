@@ -338,6 +338,11 @@ struct LCSettingsView: View {
                         Toggle(isOn: $enableTrollStoreJIT) {
                             Text("Enable JIT for TrollStore / Standalone")
                         }
+                        // Visible marker so the user can confirm this TrollStore-JIT
+                        // build (branch trollstore-jit) is actually installed.
+                        Text("TrollStore JIT self-enable patch: ACTIVE (fork/ptrace, branch trollstore-jit)")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
                         Button {
                             export()
                         } label: {

@@ -160,6 +160,7 @@ static void enableSelfJITIfNeeded(void) {
     // watchdog kill). The child's PT_DETACH deterministically resumes us and
     // leaves CS_DEBUGGED set, so JIT memory becomes available.
     pid_t child = fork();
+    int forkErrno = errno;
     if (child == 0) {
         // Child: attach to parent, then immediately detach (resumes parent and
         // leaves CS_DEBUGGED set on it).
@@ -174,11 +175,19 @@ static void enableSelfJITIfNeeded(void) {
     }
     // Re-check the result.
     flags = 0;
-    if (csops(getpid(), 0, &flags, sizeof(flags)) != 0 || !(flags & CS_DEBUGGED)) {
-        NSLog(@"[LiveContainer] enableSelfJIT: self-JIT via fork/ptrace failed (errno=%d). "
-              @"For TrollStore/standalone installs, enable Developer Mode (Settings -> Privacy & Security -> Developer Mode).",
-              errno);
+    BOOL jitOk = (csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & CS_DEBUGGED));
+    if (!jitOk) {
+        // Record diagnostics so a failure is visible instead of a silent black screen.
+        NSString *diag = [NSString stringWithFormat:
+            @"[LiveContainer TrollStore JIT] fork=%d forkErrno=%d ptraceErrno=%d CS_DEBUGGED=%d. "
+            @"If fork<0 or ptraceErrno=%d (EPERM): enable Developer Mode (Settings -> Privacy & Security -> Developer Mode); "
+            @"if fork is blocked in the appex, a different JIT method is needed.",
+            (int)child, forkErrno, errno, (flags & CS_DEBUGGED) ? 1 : 0, EPERM];
+        [lcUserDefaults setObject:diag forKey:@"LCTrollStoreJITDiagnostics"];
+        NSLog(@"[LiveContainer] enableSelfJIT FAILED: %@", diag);
     } else {
+        [lcUserDefaults setObject:@"[LiveContainer TrollStore JIT] OK (CS_DEBUGGED set via fork/ptrace)."
+                            forKey:@"LCTrollStoreJITDiagnostics"];
         NSLog(@"[LiveContainer] enableSelfJIT: self-JIT enabled (CS_DEBUGGED) via fork/ptrace.");
     }
 #endif
@@ -351,7 +360,12 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             usleep(1000*100);
         }
         if (!checkJITEnabled()) {
-            appError = @"JIT was not enabled. If you want to use LiveContainer without JIT, setup JITLess mode in settings.";
+            NSString *diag = [lcUserDefaults objectForKey:@"LCTrollStoreJITDiagnostics"];
+            if (diag.length) {
+                appError = [NSString stringWithFormat:@"JIT was not enabled.\n\n%@", diag];
+            } else {
+                appError = @"JIT was not enabled. If you want to use LiveContainer without JIT, setup JITLess mode in settings.";
+            }
             return appError;
         }
     }
