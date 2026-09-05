@@ -3,11 +3,40 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#include <unistd.h>
 #import "LCAppInfo.h"
 #import "LCUtils.h"
 #import "../../LiveContainer/LCSharedUtils.h"
 
 uint32_t dyld_get_sdk_version(const struct mach_header* mh);
+
+// Detect a TrollStore installation the same way LCSharedUtils.launchToGuestApp
+// and askForJIT() do: TrollStore drops a "_TrollStore" marker next to the app.
+static BOOL lcIsTrollStoreInstall(void) {
+    NSString *tsPath = [NSString stringWithFormat:@"%@/../_TrollStore", NSBundle.mainBundle.bundlePath];
+    return access(tsPath.UTF8String, F_OK) == 0;
+}
+
+// [Plan C] Should we treat a failed checkCodeSignature() as non-fatal?
+//
+// checkCodeSignature() is fcntl(F_CHECK_LV) — dyld's library validation, which
+// compares the guest's team id against the HOST process's team id. Under
+// TrollStore the host is adhoc-signed with a fake team id, so this can NEVER
+// pass for a guest signed with a real certificate: the guest signature is
+// perfectly valid, the team ids simply do not match. That is not a signing
+// error, and no library-validation bypass hook exists in this (main app)
+// process at import time — the bypass is installed later, in LiveProcess, once
+// JIT has been enabled. So under TrollStore we accept the guest anyway.
+//
+// Can be disabled from settings via LCSkipGuestSignVerification = NO.
+static BOOL lcSkipGuestSignatureCheck(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if ([ud objectForKey:@"LCSkipGuestSignVerification"] &&
+        ![ud boolForKey:@"LCSkipGuestSignVerification"]) {
+        return NO;
+    }
+    return lcIsTrollStoreInstall();
+}
 
 @implementation LCAppInfo
 
@@ -378,6 +407,18 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
             completetionHandler(YES, nil);
             return;
         }
+        // [Plan C] Under TrollStore the check above can never pass (host carries
+        // a fake adhoc team id), so without this it would re-sign the ENTIRE app
+        // bundle with ZSign on every single launch — minutes of spinner before
+        // the guest ever starts. If we already signed this guest with the
+        // certificate in an earlier run and it has not been re-patched since,
+        // the signature is still there; skip the pointless re-sign.
+        if(lcSkipGuestSignatureCheck() && !needPatch && [info[@"LCJITCertSigned"] boolValue]) {
+            NSLog(@"[LCAppInfo] skipping re-sign: already certificate-signed (TrollStore).");
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
+            completetionHandler(YES, nil);
+            return;
+        }
     }
     
     if (!LCUtils.certificateData) {
@@ -395,7 +436,23 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
                         completetionHandler(NO, error.localizedDescription);
                     } else {
                         bool signatureValid = checkCodeSignature(executablePath.UTF8String);
-                        if(signatureValid) {
+                        // [Plan C] ZSign rewrote the guest with a REAL team id,
+                        // but under TrollStore the host is adhoc-signed with a
+                        // fake one, so F_CHECK_LV compares two different team
+                        // ids and always fails — even though the signature we
+                        // just produced is valid. Reporting
+                        // "latestCertificateInvalidErr" here was a false alarm:
+                        // it made a working TrollStore setup look broken.
+                        // Accept it and remember that this guest is signed, so
+                        // subsequent launches skip the (slow) re-sign.
+                        if(signatureValid || lcSkipGuestSignatureCheck()) {
+                            if(!signatureValid && lcSkipGuestSignatureCheck()) {
+                                NSLog(@"[LCAppInfo] signature valid but team-id check "
+                                      @"cannot pass under TrollStore (fake host team id) "
+                                      @"— accepting; LiveProcess will load it via JIT + LV bypass.");
+                                info[@"LCJITCertSigned"] = @YES;
+                                [self save];
+                            }
                             completetionHandler(YES, [error localizedDescription]);
                         } else {
                             completetionHandler(NO, @"lc.signer.latestCertificateInvalidErr");

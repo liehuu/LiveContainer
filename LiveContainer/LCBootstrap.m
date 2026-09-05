@@ -17,6 +17,22 @@
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <errno.h>
+// ptrace request constants are not reliably exposed by the public iOS SDK
+// headers; define the Darwin values we use (guarded so a real definition wins).
+#ifndef PT_ATTACHEXC
+#define PT_ATTACHEXC 14
+#endif
+#ifndef PT_DETACH
+#define PT_DETACH 11
+#endif
+// ptrace() is not declared in the public iOS SDK headers, and modern clang
+// treats an implicit function declaration as a hard error. Declare it ourselves
+// with the standard Darwin signature so the call below compiles cleanly.
+extern int ptrace(int request, pid_t pid, caddr_t addr, int data);
 
 static int (*appMain)(int, char**);
 NSUserDefaults *lcUserDefaults;
@@ -102,6 +118,122 @@ static BOOL checkJITEnabled() {
     csops(getpid(), 0, &flags, sizeof(flags));
     return (flags & CS_DEBUGGED) != 0;
 #endif
+}
+
+// Enable JIT for the current process by self-tracing.
+//
+// LiveContainer runs the guest app inside the LiveProcess extension. On a jailed
+// device the guest can only use JIT when the host process carries the kernel's
+// CS_DEBUGGED flag. Normally SideStore/AltStore attach a debugger to flip that
+// flag, but when LiveContainer is installed standalone (e.g. via TrollStore)
+// there is no debugger, so checkJITEnabled() stays false and the guest fails to
+// launch with "JIT was not enabled".
+//
+// The fix mirrors what TrollStore's own RootHelper does: a forked child attaches
+// to this process via ptrace(PT_ATTACHEXC) and immediately detaches
+// (ptrace(PT_DETACH)). The attach sets the kernel CS_DEBUGGED flag (which permits
+// writable+executable / JIT memory mappings) and the detach deterministically
+// resumes us while leaving CS_DEBUGGED set. No external debugger or server is
+// required, and unlike ptrace(PT_TRACE_ME) it cannot leave the process stopped.
+static void enableSelfJITIfNeeded(void) {
+#if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
+    return;
+#else
+    // SideStore / AltStore already provide JIT via their debugger.
+    if (isSideStore) return;
+    // User explicitly disabled this fallback (otherwise default ON).
+    if ([lcUserDefaults boolForKey:@"LCEnableTrollStoreJIT"] == NO &&
+        [lcUserDefaults objectForKey:@"LCEnableTrollStoreJIT"]) {
+        return;
+    }
+    // Already debugged (Xcode / SideStore JIT run / StosDebug)? Nothing to do.
+    int flags = 0;
+    if (csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & CS_DEBUGGED)) {
+        return;
+    }
+    // Obtain CS_DEBUGGED by having a forked child attach to us and detach again.
+    // This is the same attach/detach kernel technique TrollStore's RootHelper uses.
+    // We do it from inside the process tree (fork + child) rather than
+    // ptrace(PT_TRACE_ME) because PT_TRACE_ME stops the current thread and relies
+    // on the parent (launchd) to resume it -- which is unreliable for an App
+    // Extension and can leave LiveProcess permanently stopped (black screen ->
+    // watchdog kill). The child's PT_DETACH deterministically resumes us and
+    // leaves CS_DEBUGGED set, so JIT memory becomes available.
+    pid_t child = fork();
+    int forkErrno = errno;
+    if (child == 0) {
+        // Child: attach to parent, then immediately detach (resumes parent and
+        // leaves CS_DEBUGGED set on it).
+        ptrace(PT_ATTACHEXC, getppid(), 0, 0);
+        ptrace(PT_DETACH, getppid(), 0, 0);
+        _exit(0);
+    } else if (child > 0) {
+        // Parent: wait for the child to finish so JIT is enabled before we
+        // continue launching the guest app.
+        int status = 0;
+        while (waitpid(child, &status, 0) == -1 && errno == EINTR) {}
+    }
+    // Re-check the result.
+    flags = 0;
+    BOOL jitOk = (csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & CS_DEBUGGED));
+    if (!jitOk) {
+        // Record diagnostics so a failure is visible instead of a silent black screen.
+        NSString *diag = [NSString stringWithFormat:
+            @"[LiveContainer TrollStore JIT] fork=%d forkErrno=%d ptraceErrno=%d CS_DEBUGGED=%d. "
+            @"If fork<0 or ptraceErrno=%d (EPERM): enable Developer Mode (Settings -> Privacy & Security -> Developer Mode); "
+            @"if fork is blocked in the appex, a different JIT method is needed.",
+            (int)child, forkErrno, errno, (flags & CS_DEBUGGED) ? 1 : 0, EPERM];
+        [lcUserDefaults setObject:diag forKey:@"LCTrollStoreJITDiagnostics"];
+        NSLog(@"[LiveContainer] enableSelfJIT FAILED: %@", diag);
+    } else {
+        [lcUserDefaults setObject:@"[LiveContainer TrollStore JIT] OK (CS_DEBUGGED set via fork/ptrace)."
+                            forKey:@"LCTrollStoreJITDiagnostics"];
+        NSLog(@"[LiveContainer] enableSelfJIT: self-JIT enabled (CS_DEBUGGED) via fork/ptrace.");
+    }
+#endif
+}
+
+// Phase logger so a silent LiveProcess hang becomes diagnosable: the main app
+// reads this from the app-group shared defaults and shows the reached phases.
+// We APPEND every phase (not overwrite) so the full ordered sequence survives a
+// hang, and the user can paste all of it instead of only the last line.
+void LCTrollStoreSetDiag(NSString *phase) {
+    @try {
+        if (!lcSharedDefaults) return;
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+        NSString *s = [NSString stringWithFormat:@"[%@] %@",
+                       [fmt stringFromDate:[NSDate date]], phase];
+        NSString *existing = [lcSharedDefaults stringForKey:@"LCTrollStoreLaunchDiag"];
+        existing = existing ?: @"";
+        if (existing.length) existing = [existing stringByAppendingString:@"\n"];
+        [lcSharedDefaults setObject:[existing stringByAppendingString:s]
+                             forKey:@"LCTrollStoreLaunchDiag"];
+        [lcSharedDefaults synchronize];
+    } @catch (NSException *e) { /* ignore */ }
+}
+
+// Map a raw PC to the name of the image that contains it, WITHOUT calling
+// dladdr(). dladdr() takes dyld's image-list lock, so when the main thread is
+// stuck inside dlopen holding that lock, a watchdog calling dladdr() would
+// itself deadlock and never log anything. _dyld_get_image_header/name are
+// read-only accessors over an immutable-ish array and take no such lock, so a
+// manual linear walk is safe to run from the watchdog thread.
+static const char *lcImageNameForPC(uintptr_t pc) {
+    const char *bestName = "?";
+    uintptr_t bestHdr = 0;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h) continue;
+        uintptr_t hdr = (uintptr_t)h;
+        if (hdr <= pc && hdr > bestHdr) {
+            bestHdr = hdr;
+            const char *n = _dyld_get_image_name(i);
+            bestName = n ? n : "?";
+        }
+    }
+    return bestName;
 }
 
 static uint64_t rnd64(uint64_t v, uint64_t r) {
@@ -253,21 +385,51 @@ static void *getAppEntryPoint(void *handle) {
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
+    LCTrollStoreSetDiag(@"=== new launch ===");
+    LCTrollStoreSetDiag(@"diag:build=v4 (plan-C: cert + self-JIT)");
+    LCTrollStoreSetDiag(@"invokeAppMain:start");
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
+    // [Plan C] TrollStore / standalone: enable JIT on this process via self-trace
+    // EVEN WHEN a JITLess certificate is installed.
+    //
+    // Why: with a certificate the guest is re-signed with a REAL team id, which
+    // can never match the fake/adhoc team id TrollStore stamps onto the host.
+    // dyld's library validation (F_CHECK_LV) therefore rejects the guest and
+    // loading dies — that is exactly the "latestCertificateInvalidErr" failure.
+    // Obtaining CS_DEBUGGED lets init_bypassDyldLibValidation() below neutralise
+    // F_CHECK_LV, so "real guest signature + JIT bypass" is the combination that
+    // makes a TrollStore install work at all.
+    // Without a certificate JIT stays mandatory, so the hard failure below is
+    // kept for that case only.
+    if (!isSideStore) {
+        // Standalone / TrollStore: there is no SideStore debugger to enable JIT,
+        // so enable it on this process (the one actually running the guest) via
+        // self-trace before we assert that JIT is available.
+        enableSelfJITIfNeeded();
+        for (int i = 0; i < 10 && !checkJITEnabled(); i++) {
+            usleep(1000*100);
+        }
+        LCTrollStoreSetDiag(checkJITEnabled() ?
+            @"JIT:enabled (CS_DEBUGGED)" :
+            @"JIT:NOT enabled (certificate present, continuing without LV bypass)");
+    }
+
     if (!LCSharedUtils.certificatePassword && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
         if(@available(iOS 26.0 ,*))  {
             return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
         }
 #endif
-        // First of all, let's check if we have JIT
-        for (int i = 0; i < 10 && !checkJITEnabled(); i++) {
-            usleep(1000*100);
-        }
         if (!checkJITEnabled()) {
-            appError = @"JIT was not enabled. If you want to use LiveContainer without JIT, setup JITLess mode in settings.";
+            LCTrollStoreSetDiag(@"JIT:FAILED (no CS_DEBUGGED)");
+            NSString *diag = [lcUserDefaults objectForKey:@"LCTrollStoreJITDiagnostics"];
+            if (diag.length) {
+                appError = [NSString stringWithFormat:@"JIT was not enabled.\n\n%@", diag];
+            } else {
+                appError = @"JIT was not enabled. If you want to use LiveContainer without JIT, setup JITLess mode in settings.";
+            }
             return appError;
         }
     }
@@ -525,7 +687,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
     
-    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && isLiveProcess;
+    // [Plan C] Only take the JITLess dlopen path when we do NOT have JIT.
+    //
+    // jitless_hook_dlopen installs a hardware-breakpoint hook on dyld's mmap for
+    // one reason only: it renames the guest to a sandbox-permitted path before
+    // mapping it. With JIT enabled we use the normal dlopen path, which needs no
+    // such workaround. More importantly, the JIT path has already installed
+    // init_bypassDyldLibValidation(), which hooks THE SAME dyld mmap — running
+    // both hooks over one function is untested and risks the hard dlopen hang we
+    // spent a long time chasing. Keep them mutually exclusive.
+    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && !checkJITEnabled() && isLiveProcess;
+    LCTrollStoreSetDiag([NSString stringWithFormat:
+        @"dyld-hook:hookDlopen=%d (cert=%d jit=%d liveProcess=%d)",
+        hookDlopen, LCSharedUtils.certificatePassword ? 1 : 0,
+        checkJITEnabled() ? 1 : 0, isLiveProcess ? 1 : 0]);
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
     
     if([guestContainerInfo[@"spoofIdentifierForVendor"] boolValue]) {
@@ -568,8 +743,59 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     
     // Preload executable to bypass RT_NOLOAD
+    LCTrollStoreSetDiag(@"guest:dlopen-start");
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
+
+    // DLOPEN WATCHDOG: the iOS launch watchdog kills the process at ~20s of
+    // wall-clock. If we are still inside dlopen after ~12s the guest is hung
+    // (not crashing) — record that so the next run shows the stall instead of a
+    // silent black screen, and so we can tell a dlopen hang apart from an earlier
+    // failure. We also snapshot the blocked thread's PC to tell a dyld-internal
+    // deadlock (our no-lock vtable patch not taking effect) from a guest
+    // initializer deadlock.
+    __block BOOL lcDlopenReturned = NO;
+    dispatch_queue_t lcWatchdogQ = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), lcWatchdogQ, ^{
+        if (!lcDlopenReturned) {
+            LCTrollStoreSetDiag(@"guest:dlopen-timeout(>12s) — still blocked inside dlopen");
+            // Enumerate ALL threads (task_threads) and dump each one's PC +
+            // containing image, rather than relying on the single port captured
+            // by mach_thread_self(). Dumping every thread is far more robust
+            // here: it locates whichever thread is stuck inside dlopen even if
+            // the previously-captured port is stale or unreadable, and it avoids
+            // any dladdr()/lock dependency (lcImageNameForPC is a read-only walk).
+            thread_act_array_t threads = NULL;
+            mach_msg_type_number_t threadCount = 0;
+            kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+            if (kr == KERN_SUCCESS) {
+                NSMutableString *dump = [NSMutableString string];
+                for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+                    arm_thread_state64_t state;
+                    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+                    if (thread_get_state(threads[i], ARM_THREAD_STATE64,
+                                         (thread_state_t)&state, &count) == KERN_SUCCESS) {
+                        uintptr_t pc = (uintptr_t)state.__pc;
+                        [dump appendFormat:@"\n  t%d PC=0x%llx img=%s",
+                            (int)i, (uint64_t)pc, lcImageNameForPC(pc)];
+                    } else {
+                        [dump appendFormat:@"\n  t%d PC=? (get_state failed)", (int)i];
+                    }
+                }
+                LCTrollStoreSetDiag([NSString stringWithFormat:
+                    @"guest:dlopen-stuck-dump (%d threads):%@", (int)threadCount, dump]);
+                for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+                    mach_port_deallocate(mach_task_self(), threads[i]);
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                              threadCount * sizeof(thread_t));
+            } else {
+                LCTrollStoreSetDiag([NSString stringWithFormat:
+                    @"guest:dlopen-stuck (task_threads kr=%d)", kr]);
+            }
+        }
+    });
+
     void (^dlopenBlock)(void) = ^{
         appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
     };
@@ -581,8 +807,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     } else {
         dlopenBlock();
     }
+    lcDlopenReturned = YES;
 
     appExecutableHandle = appHandle;
+    LCTrollStoreSetDiag(@"guest:dlopen-ok");
     const char *dlerr = dlerror();
     
     if (!appHandle || (uint64_t)appHandle > 0xf00000000000) {
@@ -591,6 +819,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         } else {
             appError = @"dlopen: an unknown error occurred";
         }
+        LCTrollStoreSetDiag([NSString stringWithFormat:@"guest:dlopen-fail:%@", appError]);
         NSLog(@"[LCBootstrap] %@", appError);
         *path = oldPath;
         return appError;
@@ -632,6 +861,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     NSLog(@"[LCBootstrap] loaded bundle");
 
     // Find main()
+    LCTrollStoreSetDiag(@"guest:entry-lookup");
     appMain = getAppEntryPoint(appHandle);
     if (!appMain) {
         appError = @"Could not find the main entry point";
@@ -639,6 +869,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         *path = oldPath;
         return appError;
     }
+    LCTrollStoreSetDiag(@"guest:calling-main");
 
     // Go!
     NSLog(@"[LCBootstrap] jumping to main %p", appMain);

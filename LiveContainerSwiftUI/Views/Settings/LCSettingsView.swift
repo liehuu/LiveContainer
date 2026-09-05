@@ -64,6 +64,7 @@ struct LCSettingsView: View {
     
     @AppStorage("LCLoadTweaksToSelf") var injectToLCItelf = false
     @AppStorage("LCIgnoreJITOnLaunch") var ignoreJITOnLaunch = false
+    @AppStorage("LCEnableTrollStoreJIT") var enableTrollStoreJIT = true
     #if is32BitSupported
     @AppStorage("selected32BitLayer") var liveExec32Path : String = ""
     #endif
@@ -334,6 +335,14 @@ struct LCSettingsView: View {
                         Toggle(isOn: $disableLiveProcessWatchdog) {
                             Text("Disable LiveProcess watchdog termination")
                         }
+                        Toggle(isOn: $enableTrollStoreJIT) {
+                            Text("Enable JIT for TrollStore / Standalone")
+                        }
+                        // Visible marker so the user can confirm this TrollStore-JIT
+                        // build (branch trollstore-jit) is actually installed.
+                        Text("TrollStore JIT self-enable patch: ACTIVE (fork/ptrace, branch trollstore-jit)")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
                         Button {
                             export()
                         } label: {
