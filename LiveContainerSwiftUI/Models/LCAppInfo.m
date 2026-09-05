@@ -26,16 +26,42 @@ static BOOL lcIsTrollStoreInstall(void) {
 // perfectly valid, the team ids simply do not match. That is not a signing
 // error, and no library-validation bypass hook exists in this (main app)
 // process at import time — the bypass is installed later, in LiveProcess, once
-// JIT has been enabled. So under TrollStore we accept the guest anyway.
+// JIT has been enabled. So we accept the guest anyway.
 //
-// Can be disabled from settings via LCSkipGuestSignVerification = NO.
+// Default is YES (this fork targets TrollStore installs). Detection of the
+// TrollStore marker (`../_TrollStore`) turned out to be unreliable here, and a
+// false negative simply re-introduces the hard failure, so we default to
+// accepting rather than gating on the probe.
+// Set LCSkipGuestSignVerification = NO in settings to restore strict checking.
 static BOOL lcSkipGuestSignatureCheck(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    if ([ud objectForKey:@"LCSkipGuestSignVerification"] &&
-        ![ud boolForKey:@"LCSkipGuestSignVerification"]) {
-        return NO;
+    id value = [ud objectForKey:@"LCSkipGuestSignVerification"];
+    if (value) {
+        return [ud boolForKey:@"LCSkipGuestSignVerification"];
     }
-    return lcIsTrollStoreInstall();
+    return YES;
+}
+
+// Append a line to the shared launch-phase log so import/sign progress is
+// visible in the app list (the same key LCBootstrap writes from LiveProcess).
+static void LCAppInfoSetDiag(NSString *line) {
+    @try {
+        NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:[LCSharedUtils appGroupID]];
+        if (!ud) return;
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+        NSString *entry = [NSString stringWithFormat:@"[%@] %@",
+                           [fmt stringFromDate:[NSDate date]], line];
+        NSString *existing = [ud stringForKey:@"LCTrollStoreLaunchDiag"] ?: @"";
+        if (existing.length) existing = [existing stringByAppendingString:@"\n"];
+        NSString *combined = [existing stringByAppendingString:entry];
+        // Keep the log bounded — it accumulates across every launch.
+        if (combined.length > 4000) {
+            combined = [combined substringFromIndex:combined.length - 4000];
+        }
+        [ud setObject:combined forKey:@"LCTrollStoreLaunchDiag"];
+        [ud synchronize];
+    } @catch (NSException *e) { /* diagnostics must never break signing */ }
 }
 
 @implementation LCAppInfo
@@ -399,10 +425,15 @@ static BOOL lcSkipGuestSignatureCheck(void) {
 
     // check if iOS think this app's signature is valid, if so, we can skip any further signature check
     NSString* executablePath = [appPath stringByAppendingPathComponent:infoPlist[@"CFBundleExecutable"]];
+    LCAppInfoSetDiag([NSString stringWithFormat:
+                      @"sign:start %@ (force=%d needPatch=%d alreadySigned=%d tsDetect=%d)",
+                      infoPlist[@"CFBundleExecutable"], forceSign, needPatch,
+                      [info[@"LCJITCertSigned"] boolValue], lcIsTrollStoreInstall()]);
     if(!forceSign) {
         bool signatureValid = checkCodeSignature(executablePath.UTF8String);
         
         if(signatureValid) {
+            LCAppInfoSetDiag(@"sign:LV-ok (no re-sign needed)");
             [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
             completetionHandler(YES, nil);
             return;
@@ -414,6 +445,7 @@ static BOOL lcSkipGuestSignatureCheck(void) {
         // certificate in an earlier run and it has not been re-patched since,
         // the signature is still there; skip the pointless re-sign.
         if(lcSkipGuestSignatureCheck() && !needPatch && [info[@"LCJITCertSigned"] boolValue]) {
+            LCAppInfoSetDiag(@"sign:skipped (already certificate-signed)");
             NSLog(@"[LCAppInfo] skipping re-sign: already certificate-signed (TrollStore).");
             [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
             completetionHandler(YES, nil);
@@ -433,6 +465,7 @@ static BOOL lcSkipGuestSignatureCheck(void) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
                     if(!success) {
+                        LCAppInfoSetDiag([NSString stringWithFormat:@"sign:zsign-FAILED %@", error.localizedDescription]);
                         completetionHandler(NO, error.localizedDescription);
                     } else {
                         bool signatureValid = checkCodeSignature(executablePath.UTF8String);
@@ -446,15 +479,24 @@ static BOOL lcSkipGuestSignatureCheck(void) {
                         // Accept it and remember that this guest is signed, so
                         // subsequent launches skip the (slow) re-sign.
                         if(signatureValid || lcSkipGuestSignatureCheck()) {
-                            if(!signatureValid && lcSkipGuestSignatureCheck()) {
+                            if(!signatureValid) {
+                                // ZSign succeeded — the signature itself is good.
+                                // F_CHECK_LV only failed because the host's team
+                                // id is TrollStore's fake one, which is expected
+                                // here: LiveProcess loads the guest with JIT +
+                                // the dyld library-validation bypass instead.
+                                LCAppInfoSetDiag(@"sign:zsign-ok LV-check-bypassed (host team id is fake under TrollStore — expected)");
                                 NSLog(@"[LCAppInfo] signature valid but team-id check "
                                       @"cannot pass under TrollStore (fake host team id) "
                                       @"— accepting; LiveProcess will load it via JIT + LV bypass.");
                                 info[@"LCJITCertSigned"] = @YES;
                                 [self save];
+                            } else {
+                                LCAppInfoSetDiag(@"sign:zsign-ok LV-ok");
                             }
                             completetionHandler(YES, [error localizedDescription]);
                         } else {
+                            LCAppInfoSetDiag(@"sign:zsign-ok LV-FAILED (strict mode)");
                             completetionHandler(NO, @"lc.signer.latestCertificateInvalidErr");
                         }
                     }

@@ -231,6 +231,19 @@
     [infoDict writeToURL:infoPath error:error];
 }
 
+// [Plan C] Mirrors lcSkipGuestSignatureCheck() in LCAppInfo.m — keep both in
+// sync. When true, a failed F_CHECK_LV (library validation) is not treated as a
+// certificate problem: under TrollStore the host carries a fake adhoc team id,
+// so this check can never pass no matter how good the certificate is.
+static BOOL lcJITLessStrictCheckDisabled(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    id value = [ud objectForKey:@"LCSkipGuestSignVerification"];
+    if (value) {
+        return [ud boolForKey:@"LCSkipGuestSignVerification"];
+    }
+    return YES;
+}
+
 + (void)validateJITLessSetupWithCompletionHandler:(void (^)(BOOL success, NSError *error))completionHandler {
     // Verify that the certificate is usable
     // Create a test app bundle
@@ -259,6 +272,19 @@
             completionHandler(NO, signError);
         } else if (checkCodeSignature([tmpLibPath UTF8String])) {
             completionHandler(YES, signError);
+        } else if (lcJITLessStrictCheckDisabled()) {
+            // ZSign signed the test dylib successfully, so the certificate did
+            // work. F_CHECK_LV only failed because the host carries TrollStore's
+            // fake adhoc team id — under TrollStore this comparison can never
+            // succeed regardless of certificate quality.
+            //
+            // Plan C does not depend on JITLess at all: the guest is signed with
+            // the real certificate (so its signature is valid) and loaded in
+            // LiveProcess with JIT + the dyld library-validation bypass. Reporting
+            // a hard failure here would be a false alarm.
+            NSLog(@"[LCUtils] validateJITLessSetup: ZSign OK, F_CHECK_LV failed "
+                  @"(expected under TrollStore: fake host team id) — accepted.");
+            completionHandler(YES, nil);
         } else {
             completionHandler(NO, [NSError errorWithDomain:NSBundle.mainBundle.bundleIdentifier code:2 userInfo:@{NSLocalizedDescriptionKey: @"lc.signer.latestCertificateInvalidErr"}]);
         }
