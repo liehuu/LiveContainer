@@ -405,8 +405,21 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v5 (jailbreak-defer: Relaxin/Dopamine lv_bypass)");
+    LCTrollStoreSetDiag(@"diag:build=v6 (jailbreak-defer + roothide-isolation probe)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
+    // RootHide isolation probe: RootHide (Relaxin) hides /var/jb and skips
+    // dyld/ElleKit injection for blacklisted apps, so a TrollStore-Lite-installed
+    // LiveContainer can silently run "clean" while the user believes the
+    // jailbreak is active. Surface the raw facts so we can tell "still isolated"
+    // from "jailbreak actually injected" at a glance — that decides whether we
+    // may defer to the jailbreak's lv_bypass (works) or fall back to return-0
+    // (hangs on iOS 17 because amfid still rejects the dlopen in the kernel).
+    const char *di_insert = getenv("DYLD_INSERT_LIBRARIES");
+    LCTrollStoreSetDiag([NSString stringWithFormat:
+        @"diag:jb-probe /var/jb=%d /var/mobile=%d DYLD_INSERT=%@",
+        access("/var/jb", F_OK) == 0,
+        access("/var/mobile", R_OK) == 0,
+        di_insert ? [NSString stringWithUTF8String:di_insert] : @"(nil)"]);
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
