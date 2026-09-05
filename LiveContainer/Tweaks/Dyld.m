@@ -459,6 +459,7 @@ int searchVtable(void** vtable, void *func) {
 
 void *dlopen_nolock(const char *path, int mode) {
     tidToIgnore = mach_thread_self();
+    LCTrollStoreSetDiag(@"dlopen-nolock:start");
     const char *libdyldPath = "/usr/lib/system/libdyld.dylib";
     mach_header_u *libdyldHeader = LCGetLoadedImageHeader(0, libdyldPath);
     assert(libdyldHeader != NULL);
@@ -533,11 +534,13 @@ void *dlopen_nolock(const char *path, int mode) {
     }
     
     void *result;
+    LCTrollStoreSetDiag(@"dlopen-nolock:vtable-patched");
     if(hookedDlopen) {
         result = jitless_hook_dlopen(path, mode);
     } else {
         result = dlopen(path, mode);
     }
+    LCTrollStoreSetDiag(@"dlopen-nolock:done");
     
     ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ | PROT_WRITE);
     if(ret != KERN_SUCCESS) {

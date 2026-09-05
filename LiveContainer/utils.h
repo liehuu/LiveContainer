@@ -18,6 +18,9 @@ bool os_unfair_recursive_lock_tryunlock4objc(void* lock);
 struct dyld_all_image_infos *_alt_dyld_get_all_image_infos(void);
 void *getDyldBase(void);
 void init_bypassDyldLibValidation(void);
+// Phase logger shared by the bootstrap + dyld-bypass/tweak code paths so a
+// silent LiveProcess hang becomes diagnosable from the app-group defaults.
+void LCTrollStoreSetDiag(NSString *phase);
 kern_return_t builtin_vm_protect(mach_port_name_t task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_max, vm_prot_t new_prot);
 void *jitless_hook_dlopen(const char *path, int mode);
 

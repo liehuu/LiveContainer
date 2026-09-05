@@ -123,8 +123,17 @@ void init_bypassDyldLibValidation(void) {
     assert(orig_dyld_mmap);
     assert(orig_dyld_fcntl);
 
-    redirectFunction("dyld_fcntl", orig_dyld_fcntl, hooked___fcntl);
-    redirectFunction("dyld_mmap", orig_dyld_mmap, hooked_mmap);
+    // Diagnostic: record whether the dyld library-validation bypass actually
+    // installed. On some iOS/dyld builds the syscall-veneer byte signatures in
+    // dyld_bypass_validation.h don't match, so the hook silently no-ops (assert
+    // is compiled out in release) and dyld keeps doing real signature checks.
+    LCTrollStoreSetDiag([NSString stringWithFormat:@"dyld-bypass:fcntl=%p mmap=%p",
+                         (void *)orig_dyld_fcntl, (void *)orig_dyld_mmap]);
+
+    bool fcntlOk = redirectFunction("dyld_fcntl", orig_dyld_fcntl, hooked___fcntl);
+    bool mmapOk  = redirectFunction("dyld_mmap", orig_dyld_mmap, hooked_mmap);
+    LCTrollStoreSetDiag([NSString stringWithFormat:@"dyld-bypass:fcntlHook=%d mmapHook=%d",
+                         fcntlOk, mmapOk]);
 }
 
 void searchDyldFunctions(void) {

@@ -195,7 +195,7 @@ static void enableSelfJITIfNeeded(void) {
 
 // Phase logger so a silent LiveProcess crash becomes diagnosable: the main app
 // reads this from the app-group shared defaults and shows the last reached phase.
-static void LCTrollStoreSetDiag(NSString *phase) {
+void LCTrollStoreSetDiag(NSString *phase) {
     @try {
         if (!lcSharedDefaults) return;
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
@@ -686,6 +686,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     LCTrollStoreSetDiag(@"guest:dlopen-start");
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
+
+    // DLOPEN WATCHDOG: the iOS launch watchdog kills the process at ~20s of
+    // wall-clock. If we are still inside dlopen after ~12s the guest is hung
+    // (not crashing) — record that so the next run shows the stall instead of a
+    // silent black screen, and so we can tell a dlopen hang apart from an earlier
+    // failure.
+    __block BOOL lcDlopenReturned = NO;
+    dispatch_queue_t lcWatchdogQ = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), lcWatchdogQ, ^{
+        if (!lcDlopenReturned) {
+            LCTrollStoreSetDiag(@"guest:dlopen-timeout(>12s) — still blocked inside dlopen");
+        }
+    });
+
     void (^dlopenBlock)(void) = ^{
         appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
     };
@@ -697,6 +711,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     } else {
         dlopenBlock();
     }
+    lcDlopenReturned = YES;
 
     appExecutableHandle = appHandle;
     LCTrollStoreSetDiag(@"guest:dlopen-ok");
