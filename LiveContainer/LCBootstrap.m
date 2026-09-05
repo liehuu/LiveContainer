@@ -390,6 +390,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
+    LCTrollStoreSetDiag(@"diag:build=v3 (run58+)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
