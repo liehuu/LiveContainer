@@ -205,6 +205,7 @@ void LCTrollStoreSetDiag(NSString *phase) {
         NSString *s = [NSString stringWithFormat:@"[%@] %@",
                        [fmt stringFromDate:[NSDate date]], phase];
         NSString *existing = [lcSharedDefaults stringForKey:@"LCTrollStoreLaunchDiag"];
+        existing = existing ?: @"";
         if (existing.length) existing = [existing stringByAppendingString:@"\n"];
         [lcSharedDefaults setObject:[existing stringByAppendingString:s]
                              forKey:@"LCTrollStoreLaunchDiag"];
