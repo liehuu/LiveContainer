@@ -193,6 +193,20 @@ static void enableSelfJITIfNeeded(void) {
 #endif
 }
 
+// Phase logger so a silent LiveProcess crash becomes diagnosable: the main app
+// reads this from the app-group shared defaults and shows the last reached phase.
+static void LCTrollStoreSetDiag(NSString *phase) {
+    @try {
+        if (!lcSharedDefaults) return;
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+        NSString *s = [NSString stringWithFormat:@"[%@] %@",
+                       [fmt stringFromDate:[NSDate date]], phase];
+        [lcSharedDefaults setObject:s forKey:@"LCTrollStoreLaunchDiag"];
+        [lcSharedDefaults synchronize];
+    } @catch (NSException *e) { /* ignore */ }
+}
+
 static uint64_t rnd64(uint64_t v, uint64_t r) {
     r--;
     return (v + r) & ~r;
@@ -342,6 +356,7 @@ static void *getAppEntryPoint(void *handle) {
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
+    LCTrollStoreSetDiag(@"invokeAppMain:start");
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
@@ -360,6 +375,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             usleep(1000*100);
         }
         if (!checkJITEnabled()) {
+            LCTrollStoreSetDiag(@"JIT:FAILED (no CS_DEBUGGED)");
             NSString *diag = [lcUserDefaults objectForKey:@"LCTrollStoreJITDiagnostics"];
             if (diag.length) {
                 appError = [NSString stringWithFormat:@"JIT was not enabled.\n\n%@", diag];
@@ -368,6 +384,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             }
             return appError;
         }
+        LCTrollStoreSetDiag(@"JIT:enabled (CS_DEBUGGED)");
     }
 
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -666,6 +683,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     
     // Preload executable to bypass RT_NOLOAD
+    LCTrollStoreSetDiag(@"guest:dlopen-start");
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
     void (^dlopenBlock)(void) = ^{
@@ -681,6 +699,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
 
     appExecutableHandle = appHandle;
+    LCTrollStoreSetDiag(@"guest:dlopen-ok");
     const char *dlerr = dlerror();
     
     if (!appHandle || (uint64_t)appHandle > 0xf00000000000) {
@@ -730,6 +749,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     NSLog(@"[LCBootstrap] loaded bundle");
 
     // Find main()
+    LCTrollStoreSetDiag(@"guest:entry-lookup");
     appMain = getAppEntryPoint(appHandle);
     if (!appMain) {
         appError = @"Could not find the main entry point";
@@ -737,6 +757,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         *path = oldPath;
         return appError;
     }
+    LCTrollStoreSetDiag(@"guest:calling-main");
 
     // Go!
     NSLog(@"[LCBootstrap] jumping to main %p", appMain);

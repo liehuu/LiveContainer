@@ -136,7 +136,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         EmptyView()
                 })
                 .hidden()
-                
+
+                // [trollstore-jit] last guest launch phase diagnosis (app-group shared).
+                if let diag = LCUtils.appGroupUserDefault.string(forKey: "LCTrollStoreLaunchDiag"), !diag.isEmpty {
+                    Text("TS-launch: \(diag)")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal)
+                }
+
                 LazyVStack {
                     ForEach(filteredApps, id: \.self) { app in
                         LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
