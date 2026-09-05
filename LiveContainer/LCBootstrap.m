@@ -213,10 +213,6 @@ void LCTrollStoreSetDiag(NSString *phase) {
     } @catch (NSException *e) { /* ignore */ }
 }
 
-// The launching thread, captured right before dlopen so the watchdog can read
-// its register state and tell us exactly where it is stuck.
-static mach_port_t lcDlopenThread = 0;
-
 // Map a raw PC to the name of the image that contains it, WITHOUT calling
 // dladdr(). dladdr() takes dyld's image-list lock, so when the main thread is
 // stuck inside dlopen holding that lock, a watchdog calling dladdr() would
@@ -729,26 +725,44 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // failure. We also snapshot the blocked thread's PC to tell a dyld-internal
     // deadlock (our no-lock vtable patch not taking effect) from a guest
     // initializer deadlock.
-    lcDlopenThread = mach_thread_self();
     __block BOOL lcDlopenReturned = NO;
     dispatch_queue_t lcWatchdogQ = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), lcWatchdogQ, ^{
         if (!lcDlopenReturned) {
             LCTrollStoreSetDiag(@"guest:dlopen-timeout(>12s) — still blocked inside dlopen");
-            if (lcDlopenThread) {
-                arm_thread_state64_t state;
-                mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-                kern_return_t kr = thread_get_state(lcDlopenThread, ARM_THREAD_STATE64,
-                                                    (thread_state_t)&state, &count);
-                if (kr == KERN_SUCCESS) {
-                    uintptr_t pc = (uintptr_t)state.__pc;
-                    LCTrollStoreSetDiag([NSString stringWithFormat:
-                        @"guest:dlopen-stuck PC=0x%llx img=%s",
-                        (uint64_t)pc, lcImageNameForPC(pc)]);
-                } else {
-                    LCTrollStoreSetDiag([NSString stringWithFormat:
-                        @"guest:dlopen-stuck (thread_get_state kr=%d)", kr]);
+            // Enumerate ALL threads (task_threads) and dump each one's PC +
+            // containing image, rather than relying on the single port captured
+            // by mach_thread_self(). Dumping every thread is far more robust
+            // here: it locates whichever thread is stuck inside dlopen even if
+            // the previously-captured port is stale or unreadable, and it avoids
+            // any dladdr()/lock dependency (lcImageNameForPC is a read-only walk).
+            thread_act_array_t threads = NULL;
+            mach_msg_type_number_t threadCount = 0;
+            kern_return_t kr = task_threads(mach_task_self(), &threads, &threadCount);
+            if (kr == KERN_SUCCESS) {
+                NSMutableString *dump = [NSMutableString string];
+                for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+                    arm_thread_state64_t state;
+                    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+                    if (thread_get_state(threads[i], ARM_THREAD_STATE64,
+                                         (thread_state_t)&state, &count) == KERN_SUCCESS) {
+                        uintptr_t pc = (uintptr_t)state.__pc;
+                        [dump appendFormat:@"\n  t%d PC=0x%llx img=%s",
+                            (int)i, (uint64_t)pc, lcImageNameForPC(pc)];
+                    } else {
+                        [dump appendFormat:@"\n  t%d PC=? (get_state failed)", (int)i];
+                    }
                 }
+                LCTrollStoreSetDiag([NSString stringWithFormat:
+                    @"guest:dlopen-stuck-dump (%d threads):%@", (int)threadCount, dump]);
+                for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+                    mach_port_deallocate(mach_task_self(), threads[i]);
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                              threadCount * sizeof(thread_t));
+            } else {
+                LCTrollStoreSetDiag([NSString stringWithFormat:
+                    @"guest:dlopen-stuck (task_threads kr=%d)", kr]);
             }
         }
     });
