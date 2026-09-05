@@ -362,7 +362,35 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
     self.is32Bit = is32bit;
 #endif
 
-    if (!LCSharedUtils.certificatePassword || is32bit || self.dontSign) {
+    if (is32bit || self.dontSign) {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
+        completetionHandler(YES, nil);
+        return;
+    }
+
+    // TrollStore / standalone install: no JITLess certificate is available.
+    // Adhoc-sign the guest executable so LiveProcess can dlopen it. Without a
+    // valid (self-consistent) signature the kernel SIGKILLs the guest at load
+    // time, which shows up as a black screen that auto-exits — this is exactly
+    // why stock LiveContainer also fails under TrollStore. The guest runs inside
+    // LiveProcess and inherits its entitlements at runtime, so a minimal
+    // get-task-allow entitlement is enough to keep the signature valid.
+    if (!LCSharedUtils.certificatePassword) {
+        NSString *adhocEntitlements = @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            @"<plist version=\"1.0\">\n"
+            @"<dict>\n"
+            @"\t<key>get-task-allow</key>\n"
+            @"\t<true/>\n"
+            @"</dict>\n"
+            @"</plist>\n";
+        NSData *entitlementData = [adhocEntitlements dataUsingEncoding:NSUTF8StringEncoding];
+        BOOL signedOK = [NSClassFromString(@"ZSigner") adhocSignMachOAtPath:execPath
+                                                                  bundleId:infoPlist[@"CFBundleExecutable"]
+                                                         entitlementData:entitlementData];
+        if (!signedOK) {
+            NSLog(@"[LCAppInfo] adhoc sign of guest %@ failed", execPath);
+        }
         [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
         completetionHandler(YES, nil);
         return;
