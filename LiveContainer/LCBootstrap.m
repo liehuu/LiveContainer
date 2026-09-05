@@ -217,6 +217,29 @@ void LCTrollStoreSetDiag(NSString *phase) {
 // its register state and tell us exactly where it is stuck.
 static mach_port_t lcDlopenThread = 0;
 
+// Map a raw PC to the name of the image that contains it, WITHOUT calling
+// dladdr(). dladdr() takes dyld's image-list lock, so when the main thread is
+// stuck inside dlopen holding that lock, a watchdog calling dladdr() would
+// itself deadlock and never log anything. _dyld_get_image_header/name are
+// read-only accessors over an immutable-ish array and take no such lock, so a
+// manual linear walk is safe to run from the watchdog thread.
+static const char *lcImageNameForPC(uintptr_t pc) {
+    const char *bestName = "?";
+    uintptr_t bestHdr = 0;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h) continue;
+        uintptr_t hdr = (uintptr_t)h;
+        if (hdr <= pc && hdr > bestHdr) {
+            bestHdr = hdr;
+            const char *n = _dyld_get_image_name(i);
+            bestName = n ? n : "?";
+        }
+    }
+    return bestName;
+}
+
 static uint64_t rnd64(uint64_t v, uint64_t r) {
     r--;
     return (v + r) & ~r;
@@ -718,16 +741,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                                                     (thread_state_t)&state, &count);
                 if (kr == KERN_SUCCESS) {
                     uintptr_t pc = (uintptr_t)state.__pc;
-                    Dl_info info;
-                    const char *img = "?";
-                    const char *sym = "?";
-                    if (dladdr((void *)pc, &info)) {
-                        if (info.dli_fname) img = info.dli_fname;
-                        if (info.dli_sname) sym = info.dli_sname;
-                    }
                     LCTrollStoreSetDiag([NSString stringWithFormat:
-                        @"guest:dlopen-stuck PC=0x%llx img=%s sym=%s",
-                        (uint64_t)pc, img, sym]);
+                        @"guest:dlopen-stuck PC=0x%llx img=%s",
+                        (uint64_t)pc, lcImageNameForPC(pc)]);
                 } else {
                     LCTrollStoreSetDiag([NSString stringWithFormat:
                         @"guest:dlopen-stuck (thread_get_state kr=%d)", kr]);

@@ -8,6 +8,7 @@
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import UIKit
 
 class SearchContext: ObservableObject {
     @Published var query: String = ""
@@ -139,10 +140,25 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 
                 // [trollstore-jit] last guest launch phase diagnosis (app-group shared).
                 if let diag = LCUtils.appGroupUserDefault.string(forKey: "LCTrollStoreLaunchDiag"), !diag.isEmpty {
-                    Text("TS-launch: \(diag)")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("TS-launch:")
+                                .font(.footnote).bold()
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Button {
+                                UIPasteboard.general.string = diag
+                            } label: {
+                                Label("Copy", systemImage: "doc.on.doc")
+                                    .font(.footnote)
+                            }
+                        }
+                        Text(verbatim: diag)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .padding(.horizontal)
                 }
 
                 LazyVStack {
