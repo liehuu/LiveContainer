@@ -10,6 +10,19 @@
 
 uint32_t dyld_get_sdk_version(const struct mach_header* mh);
 
+// Lightweight Mach-O sniff: accepts 64-bit thin and universal (fat) images.
+// Used to gate adhoc signing so we never touch plists/pngs/etc.
+static BOOL lc_isMachOFile(NSString *path) {
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!fh) return NO;
+    NSData *magic = [fh readDataOfLength:4];
+    if (magic.length < 4) return NO;
+    const uint32_t *m = (const uint32_t *)magic.bytes;
+    uint32_t v = *m;
+    // MH_MAGIC_64, MH_CIGAM_64, FAT_MAGIC, FAT_CIGAM
+    return (v == 0xfeedfacf || v == 0xcffaedfe || v == 0xcafebabe || v == 0xbebafeca);
+}
+
 @implementation LCAppInfo
 
 - (instancetype)initWithBundlePath:(NSString*)bundlePath {
@@ -370,12 +383,16 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
     }
 
     // TrollStore / standalone install: no JITLess certificate is available.
-    // Adhoc-sign the guest executable so LiveProcess can dlopen it. Without a
-    // valid (self-consistent) signature the kernel SIGKILLs the guest at load
-    // time, which shows up as a black screen that auto-exits — this is exactly
-    // why stock LiveContainer also fails under TrollStore. The guest runs inside
-    // LiveProcess and inherits its entitlements at runtime, so a minimal
-    // get-task-allow entitlement is enough to keep the signature valid.
+    // Recursively adhoc-sign EVERY 64-bit Mach-O inside the guest .app — the
+    // main executable AND its embedded Frameworks/*.framework and *.dylib.
+    // Signing only the main executable leaves the embedded frameworks unsigned;
+    // on arm64e (PAC) dyld faults while loading them during dlopen, which kills
+    // the LiveProcess before guest:dlopen-ok is ever logged — the black screen
+    // + auto-exit. This is also why stock LiveContainer fails under TrollStore.
+    // The guest runs inside LiveProcess and inherits its entitlements at
+    // runtime, so a minimal get-task-allow entitlement keeps every signature
+    // self-consistent and loadable. (Note: this runs at IMPORT time, so the
+    // guest must be deleted and re-imported for the new signing to apply.)
     if (!LCSharedUtils.certificatePassword) {
         NSString *adhocEntitlements = @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
@@ -386,12 +403,34 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
             @"</dict>\n"
             @"</plist>\n";
         NSData *entitlementData = [adhocEntitlements dataUsingEncoding:NSUTF8StringEncoding];
-        BOOL signedOK = [NSClassFromString(@"ZSigner") adhocSignMachOAtPath:execPath
-                                                                  bundleId:infoPlist[@"CFBundleExecutable"]
-                                                         entitlementData:entitlementData];
-        if (!signedOK) {
-            NSLog(@"[LCAppInfo] adhoc sign of guest %@ failed", execPath);
+        Class zsigner = NSClassFromString(@"ZSigner");
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSDirectoryEnumerator *enumerator = [fm enumeratorAtURL:[NSURL fileURLWithPath:appPath]
+                                      includingPropertiesForKeys:@[NSURLIsRegularFileKey]
+                                                         options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                    errorHandler:nil];
+        int signedCount = 0;
+        int failCount = 0;
+        for (NSURL *fileURL in enumerator) {
+            NSNumber *isRegular = nil;
+            if (![fileURL getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:nil] || ![isRegular boolValue]) {
+                continue;
+            }
+            NSString *fp = fileURL.path;
+            if (!lc_isMachOFile(fp)) {
+                continue;
+            }
+            BOOL ok = [zsigner adhocSignMachOAtPath:fp
+                                           bundleId:infoPlist[@"CFBundleExecutable"]
+                                  entitlementData:entitlementData];
+            if (ok) {
+                signedCount++;
+            } else {
+                failCount++;
+                NSLog(@"[LCAppInfo] adhoc sign FAILED: %@", fp);
+            }
         }
+        NSLog(@"[LCAppInfo] adhoc signed %d file(s), %d failed in %@", signedCount, failCount, appPath);
         [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
         completetionHandler(YES, nil);
         return;

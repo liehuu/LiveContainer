@@ -708,6 +708,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         } else {
             appError = @"dlopen: an unknown error occurred";
         }
+        LCTrollStoreSetDiag([NSString stringWithFormat:@"guest:dlopen-fail:%@", appError]);
         NSLog(@"[LCBootstrap] %@", appError);
         *path = oldPath;
         return appError;
