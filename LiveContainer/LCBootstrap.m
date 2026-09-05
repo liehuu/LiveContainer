@@ -18,9 +18,16 @@
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <errno.h>
-#ifndef PT_TRACE_ME
-#define PT_TRACE_ME 0
+// ptrace request constants are not reliably exposed by the public iOS SDK
+// headers; define the Darwin values we use (guarded so a real definition wins).
+#ifndef PT_ATTACHEXC
+#define PT_ATTACHEXC 14
+#endif
+#ifndef PT_DETACH
+#define PT_DETACH 11
 #endif
 // ptrace() is not declared in the public iOS SDK headers, and modern clang
 // treats an implicit function declaration as a hard error. Declare it ourselves
@@ -122,10 +129,12 @@ static BOOL checkJITEnabled() {
 // there is no debugger, so checkJITEnabled() stays false and the guest fails to
 // launch with "JIT was not enabled".
 //
-// The fix mirrors what TrollStore's own RootHelper does: ptrace(PT_TRACE_ME)
-// marks this process as traced by its parent (launchd for an app/appex), which
-// makes the kernel permit writable+executable (JIT) memory mappings for the rest
-// of the process lifetime. No external debugger or server is required.
+// The fix mirrors what TrollStore's own RootHelper does: a forked child attaches
+// to this process via ptrace(PT_ATTACHEXC) and immediately detaches
+// (ptrace(PT_DETACH)). The attach sets the kernel CS_DEBUGGED flag (which permits
+// writable+executable / JIT memory mappings) and the detach deterministically
+// resumes us while leaving CS_DEBUGGED set. No external debugger or server is
+// required, and unlike ptrace(PT_TRACE_ME) it cannot leave the process stopped.
 static void enableSelfJITIfNeeded(void) {
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
     return;
@@ -142,14 +151,35 @@ static void enableSelfJITIfNeeded(void) {
     if (csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & CS_DEBUGGED)) {
         return;
     }
-    // Self-trace to obtain CS_DEBUGGED.
-    int ret = ptrace(PT_TRACE_ME, 0, 0, 0);
-    if (ret != 0) {
-        NSLog(@"[LiveContainer] enableSelfJIT: ptrace(PT_TRACE_ME) failed (errno=%d). "
-              @"For TrollStore/standalone installs, enable Developer Mode (Settings -> Privacy & Security -> Developer Mode) "
-              @"and make sure the app is installed unsandboxed.", errno);
+    // Obtain CS_DEBUGGED by having a forked child attach to us and detach again.
+    // This is the same attach/detach kernel technique TrollStore's RootHelper uses.
+    // We do it from inside the process tree (fork + child) rather than
+    // ptrace(PT_TRACE_ME) because PT_TRACE_ME stops the current thread and relies
+    // on the parent (launchd) to resume it -- which is unreliable for an App
+    // Extension and can leave LiveProcess permanently stopped (black screen ->
+    // watchdog kill). The child's PT_DETACH deterministically resumes us and
+    // leaves CS_DEBUGGED set, so JIT memory becomes available.
+    pid_t child = fork();
+    if (child == 0) {
+        // Child: attach to parent, then immediately detach (resumes parent and
+        // leaves CS_DEBUGGED set on it).
+        ptrace(PT_ATTACHEXC, getppid(), 0, 0);
+        ptrace(PT_DETACH, getppid(), 0, 0);
+        _exit(0);
+    } else if (child > 0) {
+        // Parent: wait for the child to finish so JIT is enabled before we
+        // continue launching the guest app.
+        int status = 0;
+        while (waitpid(child, &status, 0) == -1 && errno == EINTR) {}
+    }
+    // Re-check the result.
+    flags = 0;
+    if (csops(getpid(), 0, &flags, sizeof(flags)) != 0 || !(flags & CS_DEBUGGED)) {
+        NSLog(@"[LiveContainer] enableSelfJIT: self-JIT via fork/ptrace failed (errno=%d). "
+              @"For TrollStore/standalone installs, enable Developer Mode (Settings -> Privacy & Security -> Developer Mode).",
+              errno);
     } else {
-        NSLog(@"[LiveContainer] enableSelfJIT: ptrace(PT_TRACE_ME) ok, JIT (CS_DEBUGGED) enabled.");
+        NSLog(@"[LiveContainer] enableSelfJIT: self-JIT enabled (CS_DEBUGGED) via fork/ptrace.");
     }
 #endif
 }
