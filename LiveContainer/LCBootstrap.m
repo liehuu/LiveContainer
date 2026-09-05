@@ -17,6 +17,11 @@
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
+#include <sys/ptrace.h>
+#include <errno.h>
+#ifndef PT_TRACE_ME
+#define PT_TRACE_ME 0
+#endif
 
 static int (*appMain)(int, char**);
 NSUserDefaults *lcUserDefaults;
@@ -101,6 +106,47 @@ static BOOL checkJITEnabled() {
     int flags;
     csops(getpid(), 0, &flags, sizeof(flags));
     return (flags & CS_DEBUGGED) != 0;
+#endif
+}
+
+// Enable JIT for the current process by self-tracing.
+//
+// LiveContainer runs the guest app inside the LiveProcess extension. On a jailed
+// device the guest can only use JIT when the host process carries the kernel's
+// CS_DEBUGGED flag. Normally SideStore/AltStore attach a debugger to flip that
+// flag, but when LiveContainer is installed standalone (e.g. via TrollStore)
+// there is no debugger, so checkJITEnabled() stays false and the guest fails to
+// launch with "JIT was not enabled".
+//
+// The fix mirrors what TrollStore's own RootHelper does: ptrace(PT_TRACE_ME)
+// marks this process as traced by its parent (launchd for an app/appex), which
+// makes the kernel permit writable+executable (JIT) memory mappings for the rest
+// of the process lifetime. No external debugger or server is required.
+static void enableSelfJITIfNeeded(void) {
+#if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
+    return;
+#else
+    // SideStore / AltStore already provide JIT via their debugger.
+    if (isSideStore) return;
+    // User explicitly disabled this fallback (otherwise default ON).
+    if ([lcUserDefaults boolForKey:@"LCEnableTrollStoreJIT"] == NO &&
+        [lcUserDefaults objectForKey:@"LCEnableTrollStoreJIT"]) {
+        return;
+    }
+    // Already debugged (Xcode / SideStore JIT run / StosDebug)? Nothing to do.
+    int flags = 0;
+    if (csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & CS_DEBUGGED)) {
+        return;
+    }
+    // Self-trace to obtain CS_DEBUGGED.
+    int ret = ptrace(PT_TRACE_ME, 0, 0, 0);
+    if (ret != 0) {
+        NSLog(@"[LiveContainer] enableSelfJIT: ptrace(PT_TRACE_ME) failed (errno=%d). "
+              @"For TrollStore/standalone installs, enable Developer Mode (Settings -> Privacy & Security -> Developer Mode) "
+              @"and make sure the app is installed unsandboxed.", errno);
+    } else {
+        NSLog(@"[LiveContainer] enableSelfJIT: ptrace(PT_TRACE_ME) ok, JIT (CS_DEBUGGED) enabled.");
+    }
 #endif
 }
 
@@ -262,6 +308,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
         }
 #endif
+        // Standalone / TrollStore: there is no SideStore debugger to enable JIT,
+        // so enable it on this process (the one actually running the guest) via
+        // self-trace before we assert that JIT is available.
+        enableSelfJITIfNeeded();
         // First of all, let's check if we have JIT
         for (int i = 0; i < 10 && !checkJITEnabled(); i++) {
             usleep(1000*100);
