@@ -97,6 +97,20 @@ bool sideStoreExist = false;
 }
 @end
 
+// Detect a jailbroken environment so the bootstrap can defer to the jailbreak's
+// own code-signing bypass instead of installing competing hooks that hang guest
+// loading. Rootless jailbreaks (Dopamine/Relaxin) expose /var/jb as their
+// virtual root; rootful jailbreaks ship Cydia/substrate in system paths.
+// LiveContainer is installed via TrollStore(Lite) as a system app carrying
+// no-sandbox, so these paths are readable here — inside a normal app sandbox
+// they are not, and we correctly treat that as "not jailbroken".
+static BOOL lcIsJailbroken(void) {
+    if (access("/var/jb", F_OK) == 0) return YES;                  // rootless (Dopamine/Relaxin)
+    if (access("/Applications/Cydia.app", F_OK) == 0) return YES;  // rootful
+    if (access("/usr/lib/substrate", F_OK) == 0) return YES;       // rootful (legacy)
+    return NO;
+}
+
 static BOOL checkJITEnabled() {
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
     return YES;
@@ -141,6 +155,11 @@ static void enableSelfJITIfNeeded(void) {
 #else
     // SideStore / AltStore already provide JIT via their debugger.
     if (isSideStore) return;
+    // On a jailbroken device (Dopamine/Relaxin) the system's own dyld
+    // library-validation bypass already covers guest loading; self-tracing here
+    // competes with it and is what hangs guest dlopen on iOS 17. Defer to the
+    // jailbreak instead of attaching our own debugger.
+    if (lcIsJailbroken()) return;
     // User explicitly disabled this fallback (otherwise default ON).
     if ([lcUserDefaults boolForKey:@"LCEnableTrollStoreJIT"] == NO &&
         [lcUserDefaults objectForKey:@"LCEnableTrollStoreJIT"]) {
@@ -386,7 +405,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v4 (plan-C: cert + self-JIT)");
+    LCTrollStoreSetDiag(@"diag:build=v5 (jailbreak-defer: Relaxin/Dopamine lv_bypass)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
@@ -531,8 +550,18 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     // If JIT is enabled, bypass library validation so we can load arbitrary binaries
     bool isJitEnabled = checkJITEnabled();
-    if (isJitEnabled) {
+    // On a jailbroken device (Dopamine/Relaxin), do NOT install our own
+    // __fcntl/__mmap hooks: the jailbreak already patches dyld's library
+    // validation (lv_bypass.c) and dynamically trusts the guest's cdhash into
+    // the kernel trustcache. Installing ours short-circuits that with a plain
+    // "return 0" that amfid still rejects on iOS 17, which is exactly the
+    // 12s+ dlopen hang we observed. Defer to the jailbreak instead.
+    bool lcJailbroken = lcIsJailbroken();
+    if (isJitEnabled && !lcJailbroken) {
         init_bypassDyldLibValidation();
+        LCTrollStoreSetDiag(@"dyld-bypass:INSTALLED (jailed)");
+    } else if (lcJailbroken) {
+        LCTrollStoreSetDiag(@"dyld-bypass:SKIPPED (jailbroken — defer to lv_bypass)");
     }
 
     // Locate dyld image name address
