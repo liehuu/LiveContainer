@@ -212,16 +212,6 @@ void LCTrollStoreSetDiag(NSString *phase) {
     } @catch (NSException *e) { /* ignore */ }
 }
 
-// Cleared at the start of every guest launch so each run shows only its own
-// ordered phases (otherwise a hung run's tail pollutes the next run's view).
-void LCTrollStoreResetDiag(void) {
-    @try {
-        if (!lcSharedDefaults) return;
-        [lcSharedDefaults removeObjectForKey:@"LCTrollStoreLaunchDiag"];
-        [lcSharedDefaults synchronize];
-    } @catch (NSException *e) { /* ignore */ }
-}
-
 // The launching thread, captured right before dlopen so the watchdog can read
 // its register state and tell us exactly where it is stuck.
 static mach_port_t lcDlopenThread = 0;
@@ -375,7 +365,7 @@ static void *getAppEntryPoint(void *handle) {
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
-    LCTrollStoreResetDiag();
+    LCTrollStoreSetDiag(@"=== new launch ===");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
