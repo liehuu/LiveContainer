@@ -143,6 +143,94 @@ static BOOL lcShouldDeferToJailbreak(void) {
     return lcIsJailbroken() || lcForceJBMode();
 }
 
+// ---------------------------------------------------------------------------
+// [v7b] Read the Team Identifier out of a Mach-O's *CodeDirectory*.
+//
+// This is NOT the same value `ldid -e` prints. ldid shows the entitlements
+// blob's com.apple.developer.team-identifier (injected by whatever installer
+// signed the binary); library validation compares the team id stored at
+// CS_CodeDirectory.teamOffset instead. On this device those two are known to
+// disagree (entitlements says AAAAA11111), so we must read the CD directly or
+// we are aligning the wrong value.
+// ---------------------------------------------------------------------------
+static uint32_t lcRd32LE(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint32_t lcRd32BE(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static NSString *lcCopyCDTeamID(NSString *path) {
+    NSData *d = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (!d || d.length < 64) return nil;
+    const uint8_t *file = (const uint8_t *)d.bytes;
+    size_t fileLen = d.length;
+
+    const uint8_t *base = file;
+    size_t baseLen = fileLen;
+
+    // FAT container: pick the arm64 slice (fat_arch fields are big-endian).
+    uint32_t magic = lcRd32LE(file);
+    if (magic == 0xbebafeca || magic == 0xcafebabe) {
+        uint32_t nfat = lcRd32BE(file + 4);
+        if (nfat > 8) return nil;
+        BOOL found = NO;
+        for (uint32_t i = 0; i < nfat; i++) {
+            const uint8_t *fa = file + 8 + i * 20;
+            uint32_t cputype = lcRd32BE(fa);
+            uint32_t off = lcRd32BE(fa + 8);
+            uint32_t sz = lcRd32BE(fa + 12);
+            if (cputype == 0x0100000C && off + sz <= fileLen) { // CPU_TYPE_ARM64
+                base = file + off; baseLen = sz; found = YES; break;
+            }
+        }
+        if (!found) return nil;
+    }
+
+    if (baseLen < 32) return nil;
+    uint32_t mh = lcRd32LE(base);
+    if (mh != 0xfeedfacf) return nil;              // only 64-bit handled here
+    uint32_t ncmds = lcRd32LE(base + 16);
+    if (ncmds > 2000) return nil;
+
+    uint32_t cur = 32;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (cur + 8 > baseLen) break;
+        uint32_t cmd = lcRd32LE(base + cur);
+        uint32_t cmdsize = lcRd32LE(base + cur + 4);
+        if (cmdsize < 8 || cur + cmdsize > baseLen) break;
+        if (cmd == 0x1du) {                        // LC_CODE_SIGNATURE
+            uint32_t dataoff = lcRd32LE(base + cur + 8);
+            if (dataoff + 8 > baseLen) break;
+            const uint8_t *sb = base + dataoff;
+            if (lcRd32LE(sb) != 0xfade0cc0u) break;   // CSMAGIC_EMBEDDED_SIGNATURE
+            uint32_t count = lcRd32LE(sb + 8);
+            if (count > 32) break;
+            const uint8_t *idx = sb + 12;
+            for (uint32_t k = 0; k < count; k++) {
+                uint32_t type = lcRd32LE(idx + k * 8);
+                uint32_t off  = lcRd32LE(idx + k * 8 + 4);
+                if (type != 0) continue;               // CSSLOT_CODEDIRECTORY
+                const uint8_t *cd = sb + off;
+                if (off + 52 > baseLen) break;
+                if (lcRd32LE(cd) != 0xfade0c02u) break; // CSMAGIC_CODEDIRECTORY
+                uint32_t version = lcRd32LE(cd + 8);
+                if (version < 0x20200u) return nil;    // no team id slot
+                uint32_t teamOff = lcRd32LE(cd + 48);
+                const uint8_t *ts = cd + teamOff;
+                NSUInteger avail = baseLen - (ts - base);
+                NSUInteger n = 0;
+                while (n < avail && n < 64 && ts[n] != 0) n++;
+                if (n == 0) return nil;
+                return [[NSString alloc] initWithBytes:ts length:n encoding:NSUTF8StringEncoding];
+            }
+            break;
+        }
+        cur += cmdsize;
+    }
+    return nil;
+}
+
 static BOOL checkJITEnabled() {
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
     return YES;
@@ -437,7 +525,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v7 (LCForceJBMode: defer-to-jailbreak switch)");
+    LCTrollStoreSetDiag(@"diag:build=v7b (LCForceJBMode + CodeDirectory teamID probe)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     // RootHide isolation probe: RootHide (Relaxin) hides /var/jb and skips
     // dyld/ElleKit injection for blacklisted apps, so a TrollStore-Lite-installed
@@ -825,6 +913,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         tweakLoaderLoaded = true;
     }
     
+    // [v7b] Print the CodeDirectory team ids that library validation actually
+    // compares. `ldid -e` reports the entitlements blob's value instead, and on
+    // this device the two are known to disagree (entitlements: AAAAA11111).
+    // If host and guest differ here, that alone explains the dlopen rejection.
+    {
+        const char *hostImg = _dyld_get_image_name(0);
+        NSString *hostTeam = hostImg ? lcCopyCDTeamID(@(hostImg)) : nil;
+        NSString *guestTeam = lcCopyCDTeamID(appBundle.executablePath);
+        LCTrollStoreSetDiag([NSString stringWithFormat:
+            @"diag:cd-teamid host=%@ guest=%@ match=%d",
+            hostTeam ?: @"(none)",
+            guestTeam ?: @"(none)",
+            (int)(hostTeam && guestTeam && [hostTeam isEqualToString:guestTeam])]);
+    }
     // Preload executable to bypass RT_NOLOAD
     LCTrollStoreSetDiag(@"guest:dlopen-start");
     appMainImageIndex = _dyld_image_count();
