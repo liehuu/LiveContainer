@@ -160,7 +160,24 @@ static uint32_t lcRd32BE(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static NSString *lcCopyCDTeamID(NSString *path) {
+#define LC_CSMAGIC_EMBEDDED_SIGNATURE 0xfade0cc0u
+#define LC_CSMAGIC_CODEDIRECTORY      0xfade0c02u
+#define LC_CSSLOT_CODEDIRECTORY       0x10000u
+#define LC_CSSLOT_ALTCD_FIRST         0x1000u
+#define LC_CSSLOT_ALTCD_LAST          0x10010u
+
+// [v7c] Dump the CodeDirectory facts that library validation actually compares.
+//
+// Two bugs in the v7b version made it always print "(none)":
+//   1. it matched slot type 0, but CSSLOT_CODEDIRECTORY is 0x10000 (slot 0 does
+//      not exist in a signature SuperBlob), so every real CD was skipped;
+//   2. it read the SuperBlob/CodeDirectory fields as little-endian. Everything
+//      inside the code signature is BIG-endian on all architectures
+//      (cs_blobs.h), while the Mach-O header is native little-endian — the two
+//      must be read with different helpers.
+//
+// Output: "team=<t> ident=<id> hash=<n> ver=0x<v> slots=<types>"
+static NSString *lcCDInfo(NSString *path) {
     NSData *d = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     if (!d || d.length < 64) return nil;
     const uint8_t *file = (const uint8_t *)d.bytes;
@@ -171,7 +188,7 @@ static NSString *lcCopyCDTeamID(NSString *path) {
 
     // FAT container: pick the arm64 slice (fat_arch fields are big-endian).
     uint32_t magic = lcRd32LE(file);
-    if (magic == 0xbebafeca || magic == 0xcafebabe) {
+    if (magic == 0xbebafecau || magic == 0xcafebabeu) {
         uint32_t nfat = lcRd32BE(file + 4);
         if (nfat > 8) return nil;
         BOOL found = NO;
@@ -180,7 +197,7 @@ static NSString *lcCopyCDTeamID(NSString *path) {
             uint32_t cputype = lcRd32BE(fa);
             uint32_t off = lcRd32BE(fa + 8);
             uint32_t sz = lcRd32BE(fa + 12);
-            if (cputype == 0x0100000C && off + sz <= fileLen) { // CPU_TYPE_ARM64
+            if (cputype == 0x0100000Cu && off + sz <= fileLen) { // CPU_TYPE_ARM64
                 base = file + off; baseLen = sz; found = YES; break;
             }
         }
@@ -188,8 +205,7 @@ static NSString *lcCopyCDTeamID(NSString *path) {
     }
 
     if (baseLen < 32) return nil;
-    uint32_t mh = lcRd32LE(base);
-    if (mh != 0xfeedfacf) return nil;              // only 64-bit handled here
+    if (lcRd32LE(base) != 0xfeedfacfu) return nil;      // MH_MAGIC_64
     uint32_t ncmds = lcRd32LE(base + 16);
     if (ncmds > 2000) return nil;
 
@@ -199,36 +215,66 @@ static NSString *lcCopyCDTeamID(NSString *path) {
         uint32_t cmd = lcRd32LE(base + cur);
         uint32_t cmdsize = lcRd32LE(base + cur + 4);
         if (cmdsize < 8 || cur + cmdsize > baseLen) break;
-        if (cmd == 0x1du) {                        // LC_CODE_SIGNATURE
+        if (cmd == 0x1du) {                             // LC_CODE_SIGNATURE
             uint32_t dataoff = lcRd32LE(base + cur + 8);
-            if (dataoff + 8 > baseLen) break;
+            if (dataoff + 12 > baseLen) break;
             const uint8_t *sb = base + dataoff;
-            if (lcRd32LE(sb) != 0xfade0cc0u) break;   // CSMAGIC_EMBEDDED_SIGNATURE
-            uint32_t count = lcRd32LE(sb + 8);
-            if (count > 32) break;
+            if (lcRd32BE(sb) != LC_CSMAGIC_EMBEDDED_SIGNATURE) break;
+            uint32_t count = lcRd32BE(sb + 8);
+            if (count == 0 || count > 32) break;
             const uint8_t *idx = sb + 12;
+
+            NSMutableString *slots = [NSMutableString string];
+            const uint8_t *mainCD = NULL;
             for (uint32_t k = 0; k < count; k++) {
-                uint32_t type = lcRd32LE(idx + k * 8);
-                uint32_t off  = lcRd32LE(idx + k * 8 + 4);
-                if (type != 0) continue;               // CSSLOT_CODEDIRECTORY
-                const uint8_t *cd = sb + off;
-                if (off + 52 > baseLen) break;
-                if (lcRd32LE(cd) != 0xfade0c02u) break; // CSMAGIC_CODEDIRECTORY
-                uint32_t version = lcRd32LE(cd + 8);
-                if (version < 0x20200u) return nil;    // no team id slot
-                uint32_t teamOff = lcRd32LE(cd + 48);
-                const uint8_t *ts = cd + teamOff;
-                NSUInteger avail = baseLen - (ts - base);
-                NSUInteger n = 0;
-                while (n < avail && n < 64 && ts[n] != 0) n++;
-                if (n == 0) return nil;
-                return [[NSString alloc] initWithBytes:ts length:n encoding:NSUTF8StringEncoding];
+                uint32_t type = lcRd32BE(idx + k * 8);
+                uint32_t off  = lcRd32BE(idx + k * 8 + 4);
+                [slots appendFormat:(k ? @",0x%x" : @"0x%x"), type];
+                if (type == LC_CSSLOT_CODEDIRECTORY) mainCD = sb + off;
             }
-            break;
+            if (!mainCD) break;
+            if ((size_t)(mainCD - base) + 52 > baseLen) break;
+            if (lcRd32BE(mainCD) != LC_CSMAGIC_CODEDIRECTORY) break;
+
+            uint32_t version = lcRd32BE(mainCD + 8);
+            if (version < 0x20200u) {
+                return [NSString stringWithFormat:@"team=(cd-too-old) ident=? ver=0x%x slots=%@",
+                        version, slots];
+            }
+            uint32_t identOff = lcRd32BE(mainCD + 20);
+            uint32_t teamOff  = lcRd32BE(mainCD + 48);
+
+            NSString *ident = @"?";
+            if (identOff && (size_t)(mainCD - base) + identOff < baseLen) {
+                const uint8_t *p = mainCD + identOff;
+                NSUInteger avail = baseLen - (p - base), n = 0;
+                while (n < avail && n < 256 && p[n] != 0) n++;
+                if (n) ident = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding] ?: @"?";
+            }
+            NSString *team = @"(empty)";
+            if (teamOff && (size_t)(mainCD - base) + teamOff < baseLen) {
+                const uint8_t *p = mainCD + teamOff;
+                NSUInteger avail = baseLen - (p - base), n = 0;
+                while (n < avail && n < 64 && p[n] != 0) n++;
+                if (n) team = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding] ?: @"?";
+            }
+            return [NSString stringWithFormat:@"team=%@ ident=%@ hash=%u ver=0x%x slots=%@",
+                    team, ident, mainCD[37], version, slots];
         }
         cur += cmdsize;
     }
     return nil;
+}
+
+// Extract "<key>=<value>" out of an lcCDInfo() dump (value ends at the next space).
+static NSString *lcField(NSString *dump, NSString *key) {
+    if (!dump) return nil;
+    NSRange r = [dump rangeOfString:[key stringByAppendingString:@"="]];
+    if (r.location == NSNotFound) return nil;
+    NSString *rest = [dump substringFromIndex:NSMaxRange(r)];
+    NSRange sp = [rest rangeOfString:@" "];
+    NSString *v = (sp.location == NSNotFound) ? rest : [rest substringToIndex:sp.location];
+    return v.length ? v : nil;
 }
 
 static BOOL checkJITEnabled() {
@@ -525,7 +571,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v7b (LCForceJBMode + CodeDirectory teamID probe)");
+    LCTrollStoreSetDiag(@"diag:build=v7c (LCForceJBMode + big-endian CodeDirectory probe)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     // RootHide isolation probe: RootHide (Relaxin) hides /var/jb and skips
     // dyld/ElleKit injection for blacklisted apps, so a TrollStore-Lite-installed
@@ -535,12 +581,27 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // may defer to the jailbreak's lv_bypass (works) or fall back to return-0
     // (hangs on iOS 17 because amfid still rejects the dlopen in the kernel).
     const char *di_insert = getenv("DYLD_INSERT_LIBRARIES");
+    // Include the marker-file path and its existence so "forceJB=0" can be told
+    // apart from "marker in the wrong directory" — otherwise a failed switch
+    // looks identical to a switch that made no difference.
+    NSString *lcJBMarker = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/.lc_force_jb"];
     LCTrollStoreSetDiag([NSString stringWithFormat:
-        @"diag:jb-probe /var/jb=%d /var/mobile=%d DYLD_INSERT=%@ forceJB=%d",
+        @"diag:jb-probe /var/jb=%d /var/mobile=%d DYLD_INSERT=%@ forceJB=%d marker=%d",
         access("/var/jb", F_OK) == 0,
         access("/var/mobile", R_OK) == 0,
         di_insert ? [NSString stringWithUTF8String:di_insert] : @"(nil)",
-        [lcUserDefaults boolForKey:@"LCForceJBMode"]]);
+        [lcUserDefaults boolForKey:@"LCForceJBMode"],
+        access(lcJBMarker.fileSystemRepresentation, F_OK) == 0]);
+
+    // [v7c] Host CodeDirectory, printed unconditionally and early: this is the
+    // value library validation compares against the guest. `ldid -e` reports the
+    // entitlements blob instead, and on this device they disagree
+    // (entitlements: AAAAA11111), so this is the only trustworthy reading.
+    {
+        const char *hostImg = _dyld_get_image_name(0);
+        LCTrollStoreSetDiag([NSString stringWithFormat:@"diag:cd-host %@",
+            hostImg ? (lcCDInfo(@(hostImg)) ?: @"(unreadable)") : @"(no image 0)"]);
+    }
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
@@ -918,14 +979,16 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // this device the two are known to disagree (entitlements: AAAAA11111).
     // If host and guest differ here, that alone explains the dlopen rejection.
     {
-        const char *hostImg = _dyld_get_image_name(0);
-        NSString *hostTeam = hostImg ? lcCopyCDTeamID(@(hostImg)) : nil;
-        NSString *guestTeam = lcCopyCDTeamID(appBundle.executablePath);
+        NSString *hostCD  = lcCDInfo(@(_dyld_get_image_name(0) ?: ""));
+        NSString *guestCD = lcCDInfo(appBundle.executablePath);
+        // Compare only the team= portion of each dump.
+        NSString *hostTeam  = lcField(hostCD,  @"team");
+        NSString *guestTeam = lcField(guestCD, @"team");
         LCTrollStoreSetDiag([NSString stringWithFormat:
             @"diag:cd-teamid host=%@ guest=%@ match=%d",
-            hostTeam ?: @"(none)",
-            guestTeam ?: @"(none)",
+            hostTeam ?: @"(none)", guestTeam ?: @"(none)",
             (int)(hostTeam && guestTeam && [hostTeam isEqualToString:guestTeam])]);
+        LCTrollStoreSetDiag([NSString stringWithFormat:@"diag:cd-guest %@", guestCD ?: @"(unreadable)"]);
     }
     // Preload executable to bypass RT_NOLOAD
     LCTrollStoreSetDiag(@"guest:dlopen-start");
