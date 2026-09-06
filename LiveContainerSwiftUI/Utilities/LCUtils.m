@@ -139,8 +139,23 @@
     }
 
     NSLog(@"[LC] starting signing...");
+
+    // [v10] Sign the *guest* with its own CFBundleIdentifier, not the host's.
+    // NSBundle.mainBundle is LiveContainer itself, so passing it as bundleId
+    // embedded "com.kdt.livecontainer" into the guest CodeDirectory. amfid
+    // rejects that at dlopen ("code signature invalid") because the CD ident
+    // does not match the guest's own Info.plist. Read the id from the bundle's
+    // Info.plist so host and guest identities are consistent.
+    NSString *bundleId = nil;
+    NSString *infoPlistPath = [[path path] stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *infoDict = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+    bundleId = infoDict[@"CFBundleIdentifier"];
+    if (![bundleId isKindOfClass:NSString.class] || bundleId.length == 0) {
+        bundleId = NSBundle.mainBundle.bundleIdentifier; // preserve old behaviour as fallback
+    }
+    NSLog(@"[LC] signing guest with bundle id: %@", bundleId);
     
-    NSProgress* ans = [NSClassFromString(@"ZSigner") signWithAppPath:[path path] bundleId:NSBundle.mainBundle.bundleIdentifier cert:self.certificateData pass:LCSharedUtils.certificatePassword completionHandler:completionHandler];
+    NSProgress* ans = [NSClassFromString(@"ZSigner") signWithAppPath:[path path] bundleId:bundleId cert:self.certificateData pass:LCSharedUtils.certificatePassword completionHandler:completionHandler];
     
     return ans;
 }

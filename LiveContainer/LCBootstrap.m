@@ -608,7 +608,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v9 (CD slot fix + flags/LV report + force-resign)");
+    LCTrollStoreSetDiag(@"diag:build=v10 (guest bundle-id fix: sign guest with its own CFBundleIdentifier)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     // RootHide isolation probe: RootHide (Relaxin) hides /var/jb and skips
     // dyld/ElleKit injection for blacklisted apps, so a TrollStore-Lite-installed
