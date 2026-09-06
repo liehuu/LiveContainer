@@ -277,17 +277,6 @@ static NSString *lcCDInfo(NSString *path) {
             if (altCD && (size_t)(altCD - base) + 52 <= baseLen &&
                 lcRd32BE(altCD) == LC_CSMAGIC_CODEDIRECTORY) {
                 uint32_t aVer = lcRd32BE(altCD + 8);
-                NSString *aTeam = @"(empty)";
-                if (aVer >= 0x20200u) {
-                    uint32_t aTeamOff = lcRd32BE(altCD + 48);
-                    if (aTeamOff && (size_t)(altCD - base) + aTeamOff < baseLen) {
-                        const uint8_t *p = altCD + aTeamOff;
-                        NSUInteger avail = baseLen - (p - base), n = 0;
-                        while (n < avail && n < 64 && p[n] != 0) n++;
-                        if (n) aTeam = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding] ?: @"?";
-                    }
-                }
-                uint32_t aVer  = lcRd32BE(altCD + 8);
                 uint32_t aFlags = (aVer >= 0x20100u) ? lcRd32BE(altCD + 12) : 0;
                 NSString *aTeam = @"(empty)";
                 if (aVer >= 0x20200u) {
