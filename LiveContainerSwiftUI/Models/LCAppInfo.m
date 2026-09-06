@@ -42,6 +42,21 @@ static BOOL lcSkipGuestSignatureCheck(void) {
     return YES;
 }
 
+// [v9] Force a real ZSign pass even though the guest is marked as already
+// signed. Once a guest has been signed, LCJITCertSigned makes every later
+// launch skip re-signing, which is normally right — but with a 7 day free
+// certificate the embedded provisioning profile expires, and "already signed"
+// then means "still carrying the dead signature". Touch this marker file in
+// LiveContainer's Documents directory (next to Applications/) to re-sign:
+//     Documents/.lc_force_resign
+static BOOL lcForceResignRequested(NSString *appPath) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if ([ud boolForKey:@"LCForceResign"]) return YES;
+    NSString *docs = [[appPath stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    NSString *marker = [docs stringByAppendingPathComponent:@".lc_force_resign"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:marker];
+}
+
 // Append a line to the shared launch-phase log so import/sign progress is
 // visible in the app list (the same key LCBootstrap writes from LiveProcess).
 static void LCAppInfoSetDiag(NSString *line) {
@@ -352,6 +367,14 @@ static void LCAppInfoSetDiag(NSString *line) {
 - (void)patchExecAndSignIfNeedWithCompletionHandler:(void(^)(bool success, NSString* errorInfo))completetionHandler progressHandler:(void(^)(NSProgress* progress))progressHandler forceSign:(BOOL)forceSign {
     [NSUserDefaults.standardUserDefaults setObject:@(YES) forKey:@"SigningInProgress"];
     NSString *appPath = self.bundlePath;
+
+    // [v9] .lc_force_resign in Documents (or the NSUserDefaults key) overrides
+    // the LCJITCertSigned shortcut so the guest is re-signed with whatever
+    // certificate is currently imported.
+    if (!forceSign && lcForceResignRequested(appPath)) {
+        forceSign = YES;
+        LCAppInfoSetDiag(@"sign:force-resign (marker .lc_force_resign present)");
+    }
 
     NSMutableDictionary *info = _info;
     NSMutableDictionary *infoPlist = _infoPlist;

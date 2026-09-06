@@ -162,20 +162,30 @@ static uint32_t lcRd32BE(const uint8_t *p) {
 
 #define LC_CSMAGIC_EMBEDDED_SIGNATURE 0xfade0cc0u
 #define LC_CSMAGIC_CODEDIRECTORY      0xfade0c02u
-#define LC_CSSLOT_CODEDIRECTORY       0x10000u
+// [v9] Slot indexes (ZSign/common/mach-o.h, matching Apple's cs_blobs.h).
+// v7c "fixed" this to 0x10000 and that was backwards: 0x10000 is
+// CSSLOT_SIGNATURESLOT (the CMS blob, whose magic is CSMAGIC_BLOBWRAPPER
+// 0xfade0b01) — exactly the "(err:cd-magic:0xfade0b01)" the device reported.
+// The CodeDirectory lives in slot 0. The v7b code had it right.
+#define LC_CSSLOT_CODEDIRECTORY       0u
+#define LC_CSSLOT_SIGNATURESLOT       0x10000u
 #define LC_CSSLOT_ALTCD_FIRST         0x1000u
-#define LC_CSSLOT_ALTCD_LAST          0x10010u
+#define LC_CSSLOT_ALTCD_LAST          0x1005u
+#define LC_CS_REQUIRE_LV              0x00002000u
+#define LC_CS_ADHOC                   0x00000002u
 
 // [v8] Report the CodeDirectory facts that library validation actually compares.
 //
-// v7c fixed the slot type (CSSLOT_CODEDIRECTORY is 0x10000, not 0) and the byte
-// order (code signing blobs are big-endian, the Mach-O header is little-endian),
-// but still collapsed every failure into nil, so the log could not say *where*
-// parsing stopped. Every failure now returns an "(err:...)" tag instead, and the
-// alternate CodeDirectory (CSSLOT_ALTERNATE_CODEDIRECTORIES, which is where the
-// real SHA256 CD lives after a CoreTrust bypass) is reported too.
+// v9 corrects the slot index (CSSLOT_CODEDIRECTORY is 0; 0x10000 is the CMS
+// slot, which is why v8 read blob-wrapper magic there) and now also reports the
+// CodeDirectory *flags*, because that decides whether library validation is
+// enforced at all: if the host CD does not carry CS_REQUIRE_LV, dyld never
+// compares team ids and only amfid's "is this signature valid" check matters.
+// The alternate CodeDirectory (CSSLOT_ALTERNATE_CODEDIRECTORIES, where the real
+// SHA256 CD lives after a CoreTrust bypass) is reported too.
 //
-// Output: "team=<t> ident=<id> hash=<n> ver=0x<v> slots=<types> alt=<team>/<hash>"
+// Output: "team=<t> ident=<id> hash=<n> ver=0x<v> flags=0x<f>[+LV|+ADHOC]
+//          slots=<types> alt=<team>/<hash>/0x<flags>"
 static NSString *lcCDInfo(NSString *path) {
     NSData *d = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     if (!d) return @"(err:open)";
@@ -277,10 +287,27 @@ static NSString *lcCDInfo(NSString *path) {
                         if (n) aTeam = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding] ?: @"?";
                     }
                 }
-                alt = [NSString stringWithFormat:@"%@/hash%u", aTeam, altCD[37]];
+                uint32_t aVer  = lcRd32BE(altCD + 8);
+                uint32_t aFlags = (aVer >= 0x20100u) ? lcRd32BE(altCD + 12) : 0;
+                NSString *aTeam = @"(empty)";
+                if (aVer >= 0x20200u) {
+                    uint32_t aTeamOff = lcRd32BE(altCD + 48);
+                    if (aTeamOff && (size_t)(altCD - base) + aTeamOff < baseLen) {
+                        const uint8_t *p = altCD + aTeamOff;
+                        NSUInteger avail = baseLen - (p - base), n = 0;
+                        while (n < avail && n < 64 && p[n] != 0) n++;
+                        if (n) aTeam = [[NSString alloc] initWithBytes:p length:n encoding:NSUTF8StringEncoding] ?: @"?";
+                    }
+                }
+                alt = [NSString stringWithFormat:@"%@/hash%u/0x%x%@", aTeam, altCD[37], aFlags,
+                       (aFlags & LC_CS_REQUIRE_LV) ? @"+LV" : @""];
             }
-            return [NSString stringWithFormat:@"team=%@ ident=%@ hash=%u ver=0x%x slots=%@ alt=%@",
-                    team, ident, mainCD[37], version, slots, alt];
+            uint32_t flags = (version >= 0x20100u) ? lcRd32BE(mainCD + 12) : 0;
+            NSMutableString *f = [NSMutableString stringWithFormat:@"0x%x", flags];
+            if (flags & LC_CS_REQUIRE_LV) [f appendString:@"+LV"];
+            if (flags & LC_CS_ADHOC)      [f appendString:@"+ADHOC"];
+            return [NSString stringWithFormat:@"team=%@ ident=%@ hash=%u ver=0x%x flags=%@ slots=%@ alt=%@",
+                    team, ident, mainCD[37], version, f, slots, alt];
         }
         cur += cmdsize;
     }
@@ -592,7 +619,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v8 (defer-to-jailbreak + CodeDirectory err-tag probe)");
+    LCTrollStoreSetDiag(@"diag:build=v9 (CD slot fix + flags/LV report + force-resign)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     // RootHide isolation probe: RootHide (Relaxin) hides /var/jb and skips
     // dyld/ElleKit injection for blacklisted apps, so a TrollStore-Lite-installed
