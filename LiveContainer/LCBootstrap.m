@@ -111,6 +111,38 @@ static BOOL lcIsJailbroken(void) {
     return NO;
 }
 
+// [v7] Escape hatch for RootHide-style jailbreaks (Relaxin).
+//
+// RootHide deliberately hides /var/jb and skips dyld/ElleKit injection for
+// blacklisted apps. A TrollStore(Lite)-installed LiveContainer therefore *is*
+// running on a jailbroken kernel while every in-process probe says otherwise:
+//   access("/var/jb")     -> ENOENT
+//   DYLD_INSERT_LIBRARIES -> (nil)
+// so lcIsJailbroken() returns NO and we install our own __fcntl/__mmap bypass.
+// Those hooks are a *jailed-device* strategy: they short-circuit dyld's
+// validation with a plain "return 0". On a jailbroken kernel that is strictly
+// worse than doing nothing, because amfid is already patched and would have
+// accepted the guest outright — our stub just makes dyld skip the bookkeeping
+// it needs and guest dlopen blocks forever (the 12s watchdog hang).
+//
+// This switch lets us take the "jailbroken" branch explicitly, so the two
+// strategies become independently testable without a rebuild:
+//   LCForceJBMode = NO  (default) -> install our hooks      (old behaviour)
+//   LCForceJBMode = YES           -> defer to the jailbreak (never tested)
+static BOOL lcForceJBMode(void) {
+    if ([lcUserDefaults boolForKey:@"LCForceJBMode"]) return YES;
+    // Marker file so the switch can be flipped from Filza/NewTerm without a
+    // settings UI: create an empty file named ".lc_force_jb" in LiveContainer's
+    // Documents folder (the same folder that holds "Applications/").
+    NSString *marker = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/.lc_force_jb"];
+    return access(marker.fileSystemRepresentation, F_OK) == 0;
+}
+
+// Should we install our own dyld validation hooks, or defer to the jailbreak's?
+static BOOL lcShouldDeferToJailbreak(void) {
+    return lcIsJailbroken() || lcForceJBMode();
+}
+
 static BOOL checkJITEnabled() {
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
     return YES;
@@ -405,7 +437,7 @@ static void *getAppEntryPoint(void *handle) {
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     LCTrollStoreSetDiag(@"=== new launch ===");
-    LCTrollStoreSetDiag(@"diag:build=v6 (jailbreak-defer + roothide-isolation probe)");
+    LCTrollStoreSetDiag(@"diag:build=v7 (LCForceJBMode: defer-to-jailbreak switch)");
     LCTrollStoreSetDiag(@"invokeAppMain:start");
     // RootHide isolation probe: RootHide (Relaxin) hides /var/jb and skips
     // dyld/ElleKit injection for blacklisted apps, so a TrollStore-Lite-installed
@@ -416,10 +448,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // (hangs on iOS 17 because amfid still rejects the dlopen in the kernel).
     const char *di_insert = getenv("DYLD_INSERT_LIBRARIES");
     LCTrollStoreSetDiag([NSString stringWithFormat:
-        @"diag:jb-probe /var/jb=%d /var/mobile=%d DYLD_INSERT=%@",
+        @"diag:jb-probe /var/jb=%d /var/mobile=%d DYLD_INSERT=%@ forceJB=%d",
         access("/var/jb", F_OK) == 0,
         access("/var/mobile", R_OK) == 0,
-        di_insert ? [NSString stringWithUTF8String:di_insert] : @"(nil)"]);
+        di_insert ? [NSString stringWithUTF8String:di_insert] : @"(nil)",
+        [lcUserDefaults boolForKey:@"LCForceJBMode"]]);
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
@@ -569,12 +602,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // the kernel trustcache. Installing ours short-circuits that with a plain
     // "return 0" that amfid still rejects on iOS 17, which is exactly the
     // 12s+ dlopen hang we observed. Defer to the jailbreak instead.
-    bool lcJailbroken = lcIsJailbroken();
+    // [v7] Decoupled from the real jailbreak probe: lcForceJBMode() lets us take
+    // this branch even when RootHide hides /var/jb. Self-JIT above still runs
+    // (it is gated on the *real* lcIsJailbroken()), so we keep CS_DEBUGGED while
+    // dropping the hooks that compete with the jailbreak's own lv_bypass.
+    bool lcJailbroken = lcShouldDeferToJailbreak();
     if (isJitEnabled && !lcJailbroken) {
         init_bypassDyldLibValidation();
         LCTrollStoreSetDiag(@"dyld-bypass:INSTALLED (jailed)");
     } else if (lcJailbroken) {
-        LCTrollStoreSetDiag(@"dyld-bypass:SKIPPED (jailbroken — defer to lv_bypass)");
+        LCTrollStoreSetDiag(lcIsJailbroken()
+            ? @"dyld-bypass:SKIPPED (jailbreak detected — defer to lv_bypass)"
+            : @"dyld-bypass:SKIPPED (LCForceJBMode — defer to lv_bypass)");
+    } else {
+        LCTrollStoreSetDiag(@"dyld-bypass:SKIPPED (no JIT)");
     }
 
     // Locate dyld image name address
